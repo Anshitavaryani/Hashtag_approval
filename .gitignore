@@ -1,0 +1,22 @@
+# dependencies
+/node_modules
+
+# next.js build output and the static export
+/.next/
+/out/
+
+# env files: only the example is committed
+.env*
+!.env.example
+
+# typescript (next-env.d.ts is written by next dev, next build and next typegen)
+*.tsbuildinfo
+next-env.d.ts
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
+
+# written by next dev (Next.js notes for coding assistants)
+AGENTS.md
