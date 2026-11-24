@@ -1,5 +1,5 @@
 import type { ReactNode, Ref } from "react";
-import { Ban, Check, CircleCheck, Clock, Lock, MessageSquareText, Truck } from "lucide-react";
+import { Ban, CircleCheck, Clock, Lock, PencilLine, Truck } from "lucide-react";
 
 import { ProgressBar } from "@/components/SummaryBar";
 import { formatDate } from "@/lib/format";
@@ -11,7 +11,7 @@ const READ_ONLY: Record<ReadOnlyReason, { icon: ReactNode; title: string; body: 
   LOCKED: {
     icon: <Lock className="size-5" aria-hidden />,
     title: "Your order is in production",
-    body: "Approvals and notes are closed now.",
+    body: "Your choices are final now.",
   },
   SHIPPED: {
     icon: <Truck className="size-5" aria-hidden />,
@@ -25,14 +25,8 @@ const READ_ONLY: Record<ReadOnlyReason, { icon: ReactNode; title: string; body: 
   },
 };
 
-const STEPS = [
-  ["Check each item", "Look at the artwork preview of every item."],
-  ["Approve or request changes", "Approve it if it looks right, or tell us what to change."],
-  ["We start production", "Once everything is approved, we make your order."],
-] as const;
-
 /**
- * The top of the page: the order, how it works in three steps, and how far along the approvals
+ * The top of the page: the order, what to do in one sentence, and how far along the approvals
  * are (with Approve all on wide screens; on phones it follows the items, so the customer sees the
  * artwork first). When the order can't change any more, or everything is approved, it says so.
  * Kept short so the first items show on the first screen of a phone or laptop.
@@ -62,7 +56,12 @@ export function Hero({ view, progressRef, approveAll }: { view: PublicView; prog
           <p className="max-w-xl text-[15px] leading-relaxed text-muted-foreground">
             {order.first_name ? `Hi ${order.first_name}, here's` : "Here's"} how your order will look.
           </p>
-          {state.read_only ? null : <HowItWorks done={state.status === "APPROVED" ? 2 : 0} />}
+          {state.read_only ? null : (
+            <p className="max-w-xl text-[15px] leading-relaxed">
+              Check each item. Approve it if it looks right, or reject it and tell us what to change. You can undo until we
+              start production.
+            </p>
+          )}
           <StateNote view={view} />
         </div>
         <div ref={progressRef} className="self-start rounded-xl bg-surface p-4 sm:p-5">
@@ -77,6 +76,7 @@ export function Hero({ view, progressRef, approveAll }: { view: PublicView; prog
 function Progress({ view }: { view: PublicView }) {
   const { approved_count: approved, total_count: total, status, read_only: readOnly } = view.state;
   const toReview = view.lines.filter(needsReview).length;
+  const rejected = view.lines.filter((l) => l.status === "CHANGES_REQUESTED").length;
   const line =
     total === 0
       ? "No artwork to approve yet."
@@ -85,9 +85,11 @@ function Progress({ view }: { view: PublicView }) {
         : readOnly
           ? `${total - approved} ${total - approved === 1 ? "item wasn't" : "items weren't"} approved.`
           : toReview > 0
-            ? `${toReview} ${toReview === 1 ? "item is" : "items are"} waiting for your review.`
+            ? `${toReview} ${toReview === 1 ? "item" : "items"} waiting for you.`
             : status === "CHANGES_REQUESTED"
-              ? "We're working on the changes you asked for."
+              ? rejected > 1
+                ? "We're making new versions of the items you rejected."
+                : "We're making a new version of the item you rejected."
               : status === "DRAFT"
                 ? "We'll email you when they're ready."
                 : "We'll email you when the rest are ready.";
@@ -129,7 +131,7 @@ function StateNote({ view }: { view: PublicView }) {
   if (state.status === "APPROVED") {
     return (
       <Banner tone="success" icon={<CircleCheck className="size-5" aria-hidden />} title="Everything is approved. Thank you!">
-        We&apos;ll start production soon. Until then, you can still undo an approval.
+        We&apos;ll start production soon. Until then, you can still undo a choice.
       </Banner>
     );
   }
@@ -142,8 +144,9 @@ function StateNote({ view }: { view: PublicView }) {
   }
   if (state.status === "CHANGES_REQUESTED") {
     return (
-      <Banner tone="waiting" icon={<MessageSquareText className="size-5" aria-hidden />} title="Thanks for your notes">
-        We&apos;ll email you when your updated artwork is ready. You can still approve the other items.
+      <Banner tone="waiting" icon={<PencilLine className="size-5" aria-hidden />} title="Thanks! We're working on your changes">
+        We&apos;ll email you when the new version is ready to check.
+        {view.lines.some(needsReview) ? " Meanwhile, you can check the other items." : null}
       </Banner>
     );
   }
@@ -183,32 +186,5 @@ function Banner({
         <p className={cn(tone === "success" ? "text-success" : "text-muted-foreground")}>{children}</p>
       </div>
     </div>
-  );
-}
-
-/**
- * The three steps as one compact row under the greeting, with the ones already behind the
- * customer ticked: titles only on phones and tablets, a short explanation under each on wide screens.
- */
-function HowItWorks({ done }: { done: number }) {
-  return (
-    <ol aria-label="How it works" className="grid grid-cols-3 gap-2 pt-1 sm:gap-4">
-      {STEPS.map(([title, text], i) => (
-        <li key={title} className="flex min-w-0 flex-col items-start gap-1.5 sm:flex-row sm:items-center lg:items-start lg:gap-2">
-          <span
-            className={cn(
-              "flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-bold",
-              i < done ? "bg-success text-success-foreground" : "bg-primary text-primary-foreground",
-            )}
-          >
-            {i < done ? <Check className="size-3.5" strokeWidth={3} aria-label="Done" /> : i + 1}
-          </span>
-          <span className="min-w-0">
-            <span className="block text-xs leading-snug font-semibold sm:text-sm">{title}</span>
-            <span className="mt-0.5 hidden text-xs leading-snug text-muted-foreground lg:block">{text}</span>
-          </span>
-        </li>
-      ))}
-    </ol>
   );
 }

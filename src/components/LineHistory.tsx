@@ -4,25 +4,25 @@ import { formatTime, isoTime } from "@/lib/format";
 import type { HistoryEntry, Line } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+// One sentence per entry (CHANGES-24NOV 5.3). Every choice names its version; the wording without
+// one is only for an odd entry.
 function describe(entry: HistoryEntry): string {
-  const v = entry.version ? ` Version ${entry.version}` : "";
-  switch (entry.type) {
-    case "VERSION_SENT":
-      return v ? `We sent${v}` : "We sent a new version";
+  const v = entry.version ? `Version ${entry.version}` : "";
+  switch (entry.kind) {
+    case "SENT":
+      return v ? `We sent ${v}` : "We sent a new version";
     case "APPROVED":
-      return entry.batch_id ? `You approved${v} (with Approve all)` : `You approved${v}`;
-    case "APPROVAL_UNDONE":
-      return v ? `You undid your approval of${v}` : "You undid an approval";
-    case "NOTE_ADDED":
-      return v ? `You sent a note about${v}` : "You sent a note";
-    case "NOTE_REMOVED":
-      return "You removed a note";
-    case "NOTE_RESTORED":
-      return "You restored a note";
-    default: {
-      const text = entry.type.toLowerCase().replace(/_/g, " ");
-      return text.charAt(0).toUpperCase() + text.slice(1);
-    }
+      return `${v ? `You approved ${v}` : "You approved an artwork preview"}${entry.batch_id ? " (with Approve all)" : ""}`;
+    case "WENT_BACK":
+      return v ? `You went back to ${v}` : "You went back to an earlier version";
+    case "REJECTED":
+      return v ? `You rejected ${v}` : "You rejected an artwork preview";
+    case "UNDID_APPROVAL":
+      return v ? `You undid your approval of ${v}` : "You undid an approval";
+    case "UNDID_GO_BACK":
+      return v ? `You undid going back to ${v}` : "You undid going back";
+    case "UNDID_REJECTION":
+      return v ? `You undid your rejection of ${v}` : "You undid a rejection";
   }
 }
 

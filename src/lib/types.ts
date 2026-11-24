@@ -2,8 +2,21 @@
 // prices, email or postal addresses, IPs or team names.
 
 export type ApprovalStatus = "DRAFT" | "WAITING" | "CHANGES_REQUESTED" | "APPROVED";
+/** CHANGES_REQUESTED: the customer rejected the newest version (the page says "Rejected"). */
 export type LineStatus = "NOT_SENT" | "NO_PROOF_NEEDED" | "WAITING" | "CHANGES_REQUESTED" | "APPROVED";
 export type ReadOnlyReason = "LOCKED" | "SHIPPED" | "CANCELLED";
+/** Where one sent version stands. REPLACED: a newer one was sent before it was chosen, or after it was approved. */
+export type VersionStatus = "WAITING" | "APPROVED" | "REJECTED" | "REPLACED";
+/** A customer's choice on an item: Approve or Reject the newest version, or go back to an older one. */
+export type ChoiceKind = "APPROVED" | "REJECTED" | "WENT_BACK";
+export type HistoryKind =
+  | "SENT"
+  | "APPROVED"
+  | "WENT_BACK"
+  | "REJECTED"
+  | "UNDID_APPROVAL"
+  | "UNDID_GO_BACK"
+  | "UNDID_REJECTION";
 
 export interface ProofFile {
   id: number;
@@ -13,30 +26,57 @@ export interface ProofFile {
   mime: string;
 }
 
-export interface Version {
-  version: number;
-  sent_at: string | null;
-  message: string | null;
-  files: ProofFile[];
-}
-
+/** A rejection: what the customer wrote (or null) and their pictures. `removed`: taken back with Undo. */
 export interface Note {
   event_id: number;
   body: string | null;
   created_at: string | null;
   version: number | null;
-  file_id: number | null;
   removed: boolean;
   pictures: { id: number; url: string }[];
+}
+
+export interface Version {
+  version: number;
+  sent_at: string | null;
+  message: string | null;
+  files: ProofFile[];
+  status: VersionStatus;
+  decided_at: string | null;
+  /** Set when going back to an older version rejected this one. */
+  went_back_to: number | null;
+  /** The customer's rejection of this version, when they wrote one (REJECTED only). */
+  note: Note | null;
 }
 
 export interface HistoryEntry {
   event_id: number;
   type: string;
+  kind: HistoryKind;
   version: number | null;
   created_at: string | null;
   batch_id: string | null;
   undone: boolean;
+}
+
+/** The item's last choice: what Undo takes back. */
+export interface LastChoice {
+  event_id: number;
+  kind: ChoiceKind;
+  /** The version it names: the newest for Approve and Reject, the one gone back to for Go back. */
+  version: number;
+  at: string | null;
+  /** Set when it came from Approve all. */
+  batch_id: string | null;
+}
+
+/** What the page may offer on an item now. Everything is off while the page is read-only. */
+export interface Actions {
+  approve: boolean;
+  reject: boolean;
+  /** The older versions it can go back to, newest first. */
+  go_back_to: number[];
+  undo: boolean;
 }
 
 export interface Line {
@@ -52,6 +92,8 @@ export interface Line {
   versions: Version[];
   notes: Note[];
   history: HistoryEntry[];
+  last_choice: LastChoice | null;
+  actions: Actions;
   undo_event_id: number | null;
 }
 
@@ -66,7 +108,8 @@ export interface PublicView {
   };
   support_email: string | null;
   lines: Line[];
-  last_batch: { batch_id: string; undoable: boolean } | null;
+  /** The newest Approve all: `size` items it approved; `undoable` while one of them is still its item's last choice. */
+  last_batch: { batch_id: string; undoable: boolean; size: number } | null;
 }
 
 /** A picture for the image viewers. */
@@ -78,15 +121,14 @@ export interface ViewerImage {
   alt: string;
 }
 
-/** A line the customer can approve: it has a sent proof and needs one. */
+/** A line the customer can approve: it has a sent artwork preview and needs one. */
 export const isSent = (line: Line) =>
   !line.no_proof && line.current_version > 0 && line.status !== "NOT_SENT" && line.status !== "NO_PROOF_NEEDED";
 
-/** Lines that Approve all would approve now (CONTRACT section 3, rule 5). */
-export const linesToApprove = (view: PublicView) =>
-  view.lines.filter((line) => isSent(line) && (line.status === "WAITING" || line.status === "CHANGES_REQUESTED"));
+/** The items Approve all would approve now: every item still waiting for the customer. */
+export const linesToApprove = (view: PublicView) => view.lines.filter((line) => line.actions.approve);
 
-/** Every line with a sent proof is approved, and there is at least one: the Approve all box shows ticked. */
+/** Every line with a sent artwork preview is approved, and there is at least one. */
 export const allSentApproved = (view: PublicView) => {
   const sent = view.lines.filter(isSent);
   return sent.length > 0 && sent.every((line) => line.status === "APPROVED");

@@ -2,9 +2,10 @@
 
 The page customers open from the "Your artwork is ready to review" email. It shows
 every item of their order with the artwork previews (mockups) the team sent, and lets
-them approve each item, approve everything at once, undo an approval, or request
-changes with photos. There is no login: the link itself carries a secret key. The
-team's side is in the admin panel (Orders > Artwork approval).
+them approve each item or everything at once, reject an item with a note and
+pictures, go back to an earlier version, and undo their last choice. There is no
+login: the link itself carries a secret key. The team's side is in the admin panel
+(Orders > Artwork approval).
 
 It is a static site (Next.js `output: "export"`): plain files that Apache serves,
 with no Node process on the server. The page talks to the backend's public
@@ -18,26 +19,31 @@ approval API, `/api/v1/approval`.
 - **The key** is read from the address bar and sent only in the `X-Approval-Token`
   header. It is never stored: no cookies, no localStorage. Requests use `fetch` with
   `cache: "no-store"` and `credentials: "omit"`.
-- **The layout:** a summary at the top (progress, Approve all, "How it works" in three
-  steps), then every item as a card with a small picture and its status. Choosing a
+- **The layout:** a summary at the top (what to do in one sentence, progress, Approve
+  all), then every item as a card with a small picture and its status. Choosing a
   card opens that item's review: beside the list on wide screens, full screen with
   All items / Previous / Next on phones. An order with one item opens its review
   straight away. Pictures stay small on the page (at most 420 px tall, 320 px on
-  phones) and open full size, with zoom, in a viewer.
-- **What the customer can do:**
-  - approve an item, or any version that was sent ("Approve Version 1");
-  - Approve all, which lists each item and the version it will approve first;
-  - undo the latest approval of an item, or untick Approve all to undo that step;
-  - request changes to an item or to one image, with up to 5 PNG or JPG photos of up
-    to 10 MB each, and remove or restore a note;
+  phones) and open full size, with zoom, in a viewer. Each item lists its versions
+  with where each stands (New · waiting for you, Approved, Rejected, Replaced).
+- **What the customer can do** (the buttons come from the API's `actions` for each item):
+  - approve the newest version of an item;
+  - reject it: a box for what to change and up to 5 PNG or JPG pictures of up to
+    10 MB each, then Submit (a note or a picture is needed);
+  - go back to an earlier version ("Go back to Version 1": it approves Version 1 and
+    rejects the newer ones). With only Version 1 there is nothing to go back to;
+  - undo their last choice on an item, until the team locks the order for production;
+  - Approve all, which approves the newest version of every item still waiting (it
+    lists them first), and undo that Approve all;
   - read each item's history.
-- **Words:** the page says "artwork preview", "Version 2 (latest)", "Approve artwork"
-  and "Request changes", never "proof", "draft" or "token".
+- **Words:** the page says "artwork preview", "Version 2", Approve, Reject, Go back and
+  Undo; never "proof", "draft", "token" or "Request changes".
 - **Read-only:** once the team locks the order for production, or the order ships or
   is cancelled, the page shows why and offers nothing to change.
 - **Two people on one link:** an action on an out-of-date page gets a 409 from the API
   with the latest state. The page shows it and says "This was just updated". The page
-  also reloads its data when the window regains focus.
+  also reloads its data when the window regains focus (not while the Reject box or the
+  Approve all sheet is open: choosing pictures leaves the page and comes back).
 - **Private:** every page says `noindex, nofollow` and `referrer: no-referrer`, and
   `robots.txt` disallows everything (it only counts on a subdomain; see below). No
   analytics, and nothing is loaded from another host except the API's files: the Inter
@@ -94,12 +100,12 @@ python3 -m http.server 8080 --directory /tmp/approval-preview   # http://localho
 ```
 src/app/          layout (font, toasts, noindex), the page, not-found and error screens, icon
 src/components/   ApprovalApp: the link's key, the view, every action and the layout
-                  Hero (summary, progress, How it works), ItemsOverview (the item cards),
-                  ReviewPanel (one item: pictures, versions, Approve / Request changes,
-                  notes, history), ReviewSheet (the review full screen on phones),
-                  ImageStage and ImageViewer (the picture on the page, the full-size
-                  viewer), NoteSheet, NotesList, LineHistory, SummaryBar (Approve all,
-                  the slim bar, the confirm sheet), StatusBadge, Screens, SiteChrome, ui/
+                  Hero (summary, progress), ItemsOverview (the item cards),
+                  ReviewPanel (one item: pictures, Approve / Reject, Go back, Undo,
+                  history), VersionList, RejectSheet (the Reject box), ReviewSheet (the
+                  review full screen on phones), ImageStage and ImageViewer (the picture
+                  on the page, the full-size viewer), LineHistory, SummaryBar (Approve
+                  all, the slim bar, the confirm sheet), StatusBadge, Screens, SiteChrome, ui/
 src/lib/          api.ts (fetch, errors, reading the view), lines.ts (what each item
                   shows), media.ts, token.ts, format.ts, types.ts
 public/robots.txt

@@ -1,6 +1,6 @@
 "use client";
 
-import { useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import { Dialog as DialogPrimitive } from "radix-ui";
 import { ChevronLeft, ChevronRight, ImageOff, Loader2, XIcon, ZoomIn, ZoomOut } from "lucide-react";
 
@@ -10,9 +10,9 @@ import type { ViewerImage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
- * The full-screen viewer for artwork previews, uploaded artwork and note photos. Click the
- * picture (or Zoom) to look closer and scroll around it; the arrows, the arrow keys, a swipe or
- * the small pictures at the bottom show the others.
+ * The full-screen viewer for artwork previews, uploaded artwork and the pictures of a rejection.
+ * Click the picture (or Zoom) to look closer and scroll around it; the arrows, the arrow keys, a
+ * swipe or the small pictures at the bottom show the others.
  */
 export function ImageViewer({
   images,
@@ -20,15 +20,12 @@ export function ImageViewer({
   onIndexChange,
   onClose,
   title,
-  action,
 }: {
   images: ViewerImage[];
   index: number | null;
   onIndexChange: (index: number) => void;
   onClose: () => void;
   title: string;
-  /** An extra button under the picture, e.g. "Request changes to this image". */
-  action?: (index: number) => ReactNode;
 }) {
   const open = index !== null && images.length > 0;
   const current = open ? Math.min(index, images.length - 1) : 0;
@@ -127,7 +124,6 @@ export function ImageViewer({
                 ))}
               </ul>
             ) : null}
-            {action ? action(current) : null}
           </div>
         </DialogPrimitive.Content>
       </DialogPrimitive.Portal>

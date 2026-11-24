@@ -6,18 +6,19 @@ import { toast } from "sonner";
 
 import { Hero } from "@/components/Hero";
 import { ItemsOverview } from "@/components/ItemsOverview";
-import { ReviewPanel, type LineActions, type NextStep } from "@/components/ReviewPanel";
+import { EMPTY_DRAFT, RejectSheet, type RejectDraft } from "@/components/RejectSheet";
+import { controlId, ReviewPanel, type LineActions, type NextStep } from "@/components/ReviewPanel";
 import { ReviewSheet } from "@/components/ReviewSheet";
 import { InvalidLinkScreen, LoadErrorScreen, LoadingScreen } from "@/components/Screens";
 import { SiteFooter, SiteHeader } from "@/components/SiteChrome";
-import { ApproveAllSheet, ApproveAllToggle, StickyBar } from "@/components/SummaryBar";
+import { ApproveAll, ApproveAllSheet, StickyBar } from "@/components/SummaryBar";
 import { Button } from "@/components/ui/button";
 import { approvalApi, INVALID_LINK, type Result } from "@/lib/api";
-import { firstToReview, lineTitle, nextToReview } from "@/lib/lines";
+import { firstToReview, lineTitle, nextToReview, versionName } from "@/lib/lines";
 import { useIsWide } from "@/lib/media";
 import type { Outcome } from "@/lib/outcome";
 import { readToken, serverToken, subscribeToken } from "@/lib/token";
-import { isSent, linesToApprove, type Line, type PublicView } from "@/lib/types";
+import { linesToApprove, type LastChoice, type Line, type PublicView } from "@/lib/types";
 
 type Phase =
   | { kind: "loading" }
@@ -25,8 +26,14 @@ type Phase =
   | { kind: "error"; message: string; canRetry: boolean }
   | { kind: "ready"; view: PublicView };
 
+/** The Reject box: the item it is for, and the version and last choice it recorded when it opened. */
+type RejectBox = { lineId: number; version: number; lastChoiceId: number | null; open: boolean; opened: number };
+
 // Coming back to the tab reloads the view, at most this often.
 const REFRESH_GAP_MS = 5_000;
+// For this long after an action on an item answers, that item's buttons ignore presses, so a double
+// tap or a double Enter acts once (the second press would land on the button that took its place).
+const QUIET_MS = 1_000;
 
 function phaseOf(result: Result): Phase {
   if (result.ok) {
@@ -46,6 +53,15 @@ function phaseOf(result: Result): Phase {
   }
 }
 
+/** What Undo took back, read out by the choice the page showed. */
+function undoneText(choice: LastChoice | null, title: string): string {
+  if (!choice) return `You undid your last choice on ${title}.`;
+  const version = versionName(choice.version);
+  if (choice.kind === "WENT_BACK") return `You undid going back to ${version} of ${title}.`;
+  if (choice.kind === "REJECTED") return `You undid your rejection of ${version} of ${title}.`;
+  return `You undid your approval of ${version} of ${title}.`;
+}
+
 /**
  * The whole approval page. It reads the link's key from the address (#…), loads the view, and
  * sends every customer action. Every write answers with the new view (or a 409 that carries
@@ -63,8 +79,12 @@ export default function ApprovalApp() {
   const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState("");
-  const [confirmAll, setConfirmAll] = useState(false);
-  const [undoHint, setUndoHint] = useState(false);
+  // The Approve all sheet, with the page as it was when the sheet opened.
+  const [confirmAll, setConfirmAll] = useState<{ open: boolean; view: PublicView } | null>(null);
+  const [rejectBox, setRejectBox] = useState<RejectBox | null>(null);
+  // What the customer typed and picked in each item's Reject box, for this link. In memory only:
+  // closing the box or a refused Submit keeps it; only a Submit that goes through clears it.
+  const [drafts, setDrafts] = useState<{ token: string | null; byLine: Record<number, RejectDraft> }>({ token: null, byLine: {} });
   const [refreshFailed, setRefreshFailed] = useState(false);
   // The item under review. Chosen when the view first loads (the first one waiting), so
   // approving it doesn't move the page on to another item by itself.
@@ -72,6 +92,8 @@ export default function ApprovalApp() {
   const [sheetOpen, setSheetOpen] = useState(false);
   const [summaryInView, setSummaryInView] = useState(true);
   const [approveAllInView, setApproveAllInView] = useState(false);
+  // The items (and "batch" for Approve all) whose buttons are pausing after an action answered.
+  const [paused, setPaused] = useState<ReadonlySet<string>>(new Set());
 
   const phase: Phase =
     token === undefined
@@ -81,16 +103,26 @@ export default function ApprovalApp() {
         : loaded?.token === token
           ? loaded.phase
           : { kind: "loading" };
+  // While a box is open the page doesn't reload the view: choosing pictures leaves the page and comes back.
+  const boxOpen = Boolean(confirmAll?.open || rejectBox?.open);
 
   const tokenRef = useRef<string | null | undefined>(undefined);
   const phaseRef = useRef<Phase["kind"]>("loading");
+  const boxOpenRef = useRef(false);
   const busyRef = useRef(false);
   // Counts writes, so a view requested before a write can't replace the write's answer.
   const writes = useRef(0);
   const lastLoad = useRef(0);
+  // Whether closing a box gives focus back to the button that opened it (Cancel, Escape) or not
+  // (the page moves focus itself after an answer). Radix only does it for its own Trigger, which
+  // these boxes don't use, so the page remembers the opener.
+  const rejectReturnsFocus = useRef(true);
+  const confirmReturnsFocus = useRef(true);
+  const opener = useRef<HTMLElement | null>(null);
   useEffect(() => {
     tokenRef.current = token;
     phaseRef.current = phase.kind;
+    boxOpenRef.current = boxOpen;
   });
 
   // The first load, Try again, and another link pasted into the same tab. GETs never change anything.
@@ -105,8 +137,10 @@ export default function ApprovalApp() {
         setLoaded({ token, phase: phaseOf(result) });
         const first = result.ok && result.view ? firstToReview(result.view) : null;
         if (first !== null) setPicked((current) => (current?.token === token ? current : { token, id: first }));
-        // Another link starts on its list, not inside the previous link's review.
+        // Another link starts on its list, not inside the previous link's review or boxes.
         setSheetOpen(false);
+        setRejectBox(null);
+        setConfirmAll(null);
       })
       // Never leave the customer on "Loading…": anything unexpected becomes the Try again screen.
       .catch(() =>
@@ -120,15 +154,15 @@ export default function ApprovalApp() {
     if (tokenRef.current !== forToken) return;
     lastLoad.current = Date.now();
     setRefreshFailed(false);
-    // Nothing left for Approve all (another device approved it): its sheet closes.
-    if (linesToApprove(view).length === 0) setConfirmAll(false);
+    // Fewer than two items left waiting (another device approved them): the Approve all sheet closes.
+    if (linesToApprove(view).length < 2) setConfirmAll((sheet) => (sheet?.open ? { ...sheet, open: false } : sheet));
     setLoaded({ token: forToken, phase: { kind: "ready", view } });
   }, []);
 
-  // Reloads the view when the customer comes back to the tab, unless an action is running.
+  // Reloads the view when the customer comes back to the tab, unless an action runs or a box is open.
   const refresh = useCallback(async (force = false) => {
     const current = tokenRef.current;
-    if (!current || busyRef.current) return;
+    if (!current || busyRef.current || boxOpenRef.current) return;
     if (!force && Date.now() - lastLoad.current < REFRESH_GAP_MS) return;
     if (phaseRef.current === "error") {
       setAttempt((n) => n + 1);
@@ -195,15 +229,59 @@ export default function ApprovalApp() {
     }
   }, [reveals]);
 
+  // Where focus goes once the page shows an action's answer: the first of these elements that is
+  // on the page (an item's panel may have been drawn anew). It waits while a box is still open,
+  // and is dropped when nothing fits within a few seconds.
+  const focusWanted = useRef<{ ids: string[]; until: number } | null>(null);
+  const [, setFocusRequests] = useState(0);
+  const focusLater = (ids: string[]) => {
+    focusWanted.current = { ids, until: Date.now() + 3_000 };
+    setFocusRequests((n) => n + 1);
+  };
+  useEffect(() => {
+    const want = focusWanted.current;
+    if (!want || boxOpen) return;
+    const target = want.ids.map((id) => document.getElementById(id)).find((el) => el !== null);
+    if (target || Date.now() > want.until) focusWanted.current = null;
+    target?.focus();
+  });
+
+  // A tap doesn't focus a button in every browser, so the opener's id is the fallback.
+  const rememberOpener = () => {
+    opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  };
+  const focusOpener = (fallbackId: string) => {
+    const back = opener.current?.isConnected ? opener.current : document.getElementById(fallbackId);
+    back?.focus();
+  };
+
+  const quiet = (key: string) => paused.has(key);
+  const pause = (key: string) => {
+    setPaused((keys) => new Set(keys).add(key));
+    setTimeout(
+      () =>
+        setPaused((keys) => {
+          const rest = new Set(keys);
+          rest.delete(key);
+          return rest;
+        }),
+      QUIET_MS,
+    );
+  };
+
   // The same text twice in a row is still read out.
   const announce = (message: string) => setAnnouncement((previous) => (previous === message ? `${message} ` : message));
 
-  /** Runs one write. One at a time: a second tap while one is running does nothing. */
+  /**
+   * Runs one write. One at a time: a second tap while one is running does nothing. `quiet` names
+   * the buttons that pause for a moment once it answers; `focusDone` and `focusConflict` where focus
+   * goes after a success or a 409.
+   */
   const run = async (
     key: string,
     send: (token: string) => Promise<Result>,
-    done: string,
-    options: { inlineErrors?: boolean } = {},
+    done: string | ((view: PublicView | null) => string),
+    options: { inlineErrors?: boolean; quiet?: string; focusDone?: string[]; focusConflict?: string[] } = {},
   ): Promise<Outcome> => {
     const current = tokenRef.current;
     if (!current || busyRef.current) return { status: "skipped" };
@@ -214,12 +292,15 @@ export default function ApprovalApp() {
     const viewAfter = async (view: PublicView | null) => {
       const fresh = view ?? (await approvalApi.view(current).then((r) => (r.ok ? r.view : null)));
       if (fresh) showView(current, fresh);
+      return fresh;
     };
     try {
       const result = await send(current);
+      if (options.quiet) pause(options.quiet);
       if (result.ok) {
-        await viewAfter(result.view);
-        announce(done);
+        const fresh = await viewAfter(result.view);
+        announce(typeof done === "string" ? done : done(fresh));
+        if (options.focusDone) focusLater(options.focusDone);
         return { status: "done" };
       }
       switch (result.kind) {
@@ -230,6 +311,7 @@ export default function ApprovalApp() {
           } else {
             toast.info("This was just updated", { description: "We've loaded the latest version. Please check it and try again." });
           }
+          if (options.focusConflict) focusLater(options.focusConflict);
           return { status: "conflict" };
         case "invalid":
           setLoaded({ token: current, phase: { kind: "invalid", message: result.message } });
@@ -252,39 +334,36 @@ export default function ApprovalApp() {
     }
   };
 
-  const actions: LineActions = {
-    approve: (line, version) =>
-      run(
-        `approve:${line.id}`,
-        (t) => approvalApi.approve(t, line.id, version, line.current_version),
-        `Approved Version ${version} of ${lineTitle(line)}.`,
-      ),
-    undo: (line) => {
-      const eventId = line.undo_event_id;
-      if (eventId === null) return Promise.resolve({ status: "skipped" });
-      return run(`undo:${line.id}`, (t) => approvalApi.undo(t, { event_id: eventId }), `Your approval of ${lineTitle(line)} is undone.`);
-    },
-    addNote: async (line, form) => {
-      // A note on an approved item that keeps the approval is just a note; anything else asks for changes.
-      const keeps = line.status === "APPROVED" && form.get("undo_approval") !== "true";
-      const outcome = await run(
-        `add-note:${line.id}`,
-        (t) => approvalApi.addNote(t, line.id, form),
-        `Your note about ${lineTitle(line)} was sent.`,
-        { inlineErrors: true },
-      );
-      if (outcome.status === "done") {
-        if (keeps) toast.success("Note sent", { description: "Thanks! The item stays approved." });
-        else toast.success("Request sent", { description: "We'll make the changes and send you an updated version to approve." });
-      }
-      return outcome;
-    },
-    toggleNote: (note) =>
-      run(
-        `note:${note.event_id}`,
-        (t) => (note.removed ? approvalApi.restoreNote(t, note.event_id) : approvalApi.removeNote(t, note.event_id)),
-        note.removed ? "Note restored." : "Note removed.",
-      ),
+  const item = (line: Line) => `line:${line.id}`;
+  const draftOf = (lineId: number) => (drafts.token === token ? drafts.byLine[lineId] : undefined) ?? EMPTY_DRAFT;
+  const saveDraft = (lineId: number, draft: RejectDraft | null) =>
+    setDrafts((current) => {
+      const byLine = current.token === token ? { ...current.byLine } : {};
+      if (draft) byLine[lineId] = draft;
+      else delete byLine[lineId];
+      return { token: token ?? null, byLine };
+    });
+  const closeReject = (returnFocus: boolean) => {
+    rejectReturnsFocus.current = returnFocus;
+    setRejectBox((box) => (box ? { ...box, open: false } : box));
+  };
+  // Sends exactly what the box recorded when it opened. A 409 closes it (the page shows what
+  // changed) and keeps the draft; any other refusal is shown in the box, which stays open.
+  const submitReject = async (box: RejectBox, line: Line, form: FormData): Promise<Outcome> => {
+    const outcome = await run(
+      `reject:${line.id}`,
+      (t) => approvalApi.reject(t, line.id, form),
+      `You rejected ${versionName(box.version)} of ${lineTitle(line)}.`,
+      { inlineErrors: true, quiet: item(line), focusDone: [controlId("undo", line.id)], focusConflict: [controlId("heading", line.id)] },
+    );
+    if (outcome.status === "done") {
+      toast.success(`${versionName(box.version)} rejected`, { description: "Thanks! We'll send you a new version to check." });
+      saveDraft(line.id, null);
+      closeReject(false);
+    } else if (outcome.status === "conflict") {
+      closeReject(false);
+    }
+    return outcome;
   };
 
   if (phase.kind !== "ready") {
@@ -315,41 +394,47 @@ export default function ApprovalApp() {
   const selectedId = pickedId !== null && lines.some((line) => line.id === pickedId) ? pickedId : firstToReview(view);
   const selectedIndex = lines.findIndex((line) => line.id === selectedId);
   const selected = lines[selectedIndex] ?? null;
+  const rejectLine = rejectBox ? lines.find((line) => line.id === rejectBox.lineId) : undefined;
 
+  const openApproveAll = () => {
+    if (quiet("batch") || busyRef.current) return;
+    confirmReturnsFocus.current = true;
+    rememberOpener();
+    setConfirmAll({ open: true, view });
+  };
   const approveAll = async (chosen: Line[]) => {
     const outcome = await run(
       "approve-all",
       (t) => approvalApi.approveAll(t, chosen.map((line) => ({ id: line.id, latest: line.current_version }))),
-      chosen.length === 1 ? "1 item approved." : `${chosen.length} items approved.`,
+      (fresh) => {
+        const size = fresh?.last_batch?.size || chosen.length;
+        return size === 1 ? "1 item approved." : `${size} items approved.`;
+      },
+      { quiet: "batch", focusDone: ["batch-outcome"] },
     );
-    if (outcome.status === "done" || outcome.status === "conflict") setConfirmAll(false);
+    if (outcome.status === "done") confirmReturnsFocus.current = false;
+    if (outcome.status === "done" || outcome.status === "conflict") setConfirmAll((sheet) => (sheet ? { ...sheet, open: false } : sheet));
   };
-  const untick = () => {
+  const undoApproveAll = () => {
     const batch = view.last_batch;
-    if (batch?.undoable) {
-      setUndoHint(false);
-      void run("undo-all", (t) => approvalApi.undo(t, { batch_id: batch.batch_id }), "Approve all undone.");
-    } else {
-      setUndoHint(true);
-    }
+    if (!batch?.undoable || quiet("batch")) return;
+    void run("undo-all", (t) => approvalApi.undo(t, { batch_id: batch.batch_id }), "Approve all undone.", {
+      quiet: "batch",
+      focusDone: ["approve-all"],
+    });
   };
-  // One item has its own Approve button; Approve all is for two or more, while things can still change.
-  // Wide screens show it in the summary; phones and tablets after the items, so the artwork comes first.
-  const approveAllBox = (compact: boolean) =>
-    !readOnly && lines.filter(isSent).length > 1 ? (
-      <ApproveAllToggle
-        view={view}
-        busy={busy}
-        showUndoHint={undoHint}
-        compact={compact}
-        onTick={() => {
-          setUndoHint(false);
-          setConfirmAll(true);
-        }}
-        onUntick={untick}
-      />
+  // Approve all is for two or more items waiting, while things can still change. Wide screens show
+  // it in the summary; phones and tablets after the items, so the artwork comes first.
+  const waiting = linesToApprove(view).length;
+  const approveAllBox =
+    !readOnly && (waiting >= 2 || view.last_batch?.undoable) ? (
+      <ApproveAll view={view} busy={busy} onApprove={openApproveAll} onUndo={undoApproveAll} />
     ) : null;
-  const bottomApproveAll = wide ? null : approveAllBox(false);
+  const slimApproveAll =
+    !readOnly && waiting >= 2 && !approveAllInView ? (
+      <ApproveAll view={view} busy={busy} compact onApprove={openApproveAll} onUndo={undoApproveAll} />
+    ) : null;
+  const bottomApproveAll = wide ? null : approveAllBox;
 
   const goTo = (id: number) => {
     if (!token) return;
@@ -368,15 +453,61 @@ export default function ApprovalApp() {
   };
   const nextStep = (line: Line): NextStep => {
     const following = nextToReview(lines, line.id);
-    if (following) return { label: "Next item", go: () => goTo(following.id) };
-    return wide ? null : { label: "All items", go: () => setSheetOpen(false), back: true };
+    if (following) return { label: "Next item", to: following.id };
+    return wide ? null : { label: "All items", to: null };
+  };
+  // A new version opens the item afresh, on the newest version.
+  const panelKey = (line: Line) => `${line.id}:${line.current_version}`;
+
+  const actions: LineActions = {
+    // Approve (the newest version) or Go back (an older one), with the version and last choice the page showed.
+    approve: (line, version) => {
+      if (quiet(item(line))) return;
+      const title = lineTitle(line);
+      const back = version < line.current_version;
+      void run(
+        `${back ? "go-back" : "approve"}:${line.id}`,
+        (t) => approvalApi.approve(t, line.id, version, line.current_version, line.last_choice?.event_id ?? null),
+        back ? `You went back to ${versionName(version)} of ${title}.` : `You approved ${versionName(version)} of ${title}.`,
+        { quiet: item(line), focusDone: [controlId("undo", line.id)], focusConflict: [controlId("heading", line.id)] },
+      );
+    },
+    // Opens the Reject box, which records the newest version and the last choice as they are now.
+    reject: (line) => {
+      if (quiet(item(line)) || busyRef.current) return;
+      rejectReturnsFocus.current = true;
+      rememberOpener();
+      setRejectBox((box) => ({
+        lineId: line.id,
+        version: line.current_version,
+        lastChoiceId: line.last_choice?.event_id ?? null,
+        open: true,
+        opened: (box?.opened ?? 0) + 1,
+      }));
+    },
+    undo: (line) => {
+      const eventId = line.undo_event_id ?? line.last_choice?.event_id ?? null;
+      if (eventId === null || quiet(item(line))) return;
+      void run(`undo:${line.id}`, (t) => approvalApi.undo(t, { event_id: eventId }), undoneText(line.last_choice, lineTitle(line)), {
+        quiet: item(line),
+        // Never onto another Undo: Approve when the newest is waiting again, else Go back, else the outcome's words.
+        focusDone: [controlId("approve", line.id), controlId("go-back", line.id), controlId("outcome", line.id)],
+        focusConflict: [controlId("heading", line.id)],
+      });
+    },
+    // It pauses with the item's other buttons, so a double tap on Approve doesn't skip an item.
+    next: (line, to) => {
+      if (quiet(item(line))) return;
+      if (to === null) setSheetOpen(false);
+      else goTo(to);
+    },
   };
 
   return (
     <Shell supportEmail={view.support_email} order>
-      <StickyBar view={view} visible={!summaryInView && !sheetOpen} approveAll={approveAllInView ? null : approveAllBox(true)} />
+      <StickyBar view={view} visible={!summaryInView && !sheetOpen} approveAll={slimApproveAll} />
       <main className="mx-auto w-full max-w-[1200px] flex-1 space-y-6 px-4 py-5 sm:px-6 lg:py-6">
-        <Hero view={view} progressRef={watchSummary} approveAll={wide ? approveAllBox(false) : null} />
+        <Hero view={view} progressRef={watchSummary} approveAll={wide ? approveAllBox : null} />
         {refreshFailed ? (
           <div
             role="status"
@@ -396,10 +527,11 @@ export default function ApprovalApp() {
           </p>
         ) : lines.length === 1 ? (
           <ReviewPanel
-            key={selected.id}
+            key={panelKey(selected)}
             line={selected}
             readOnly={readOnly}
             busy={busy}
+            paused={quiet(item(selected))}
             actions={actions}
             layout={wide ? "split" : "stack"}
             next={null}
@@ -411,11 +543,12 @@ export default function ApprovalApp() {
             </div>
             <div className="scroll-mt-20">
               <ReviewPanel
-                key={selected.id}
+                key={panelKey(selected)}
                 line={selected}
                 position={{ index: selectedIndex + 1, total: lines.length }}
                 readOnly={readOnly}
                 busy={busy}
+                paused={quiet(item(selected))}
                 actions={actions}
                 layout="split"
                 nav={{ previous: step(-1), next: step(1) }}
@@ -441,10 +574,11 @@ export default function ApprovalApp() {
               onNext={step(1)}
             >
               <ReviewPanel
-                key={selected.id}
+                key={panelKey(selected)}
                 line={selected}
                 readOnly={readOnly}
                 busy={busy}
+                paused={quiet(item(selected))}
                 actions={actions}
                 layout="stack"
                 framed={false}
@@ -454,7 +588,40 @@ export default function ApprovalApp() {
           </>
         )}
       </main>
-      <ApproveAllSheet view={view} open={confirmAll} busy={busy} onOpenChange={setConfirmAll} onConfirm={approveAll} />
+      {confirmAll ? (
+        <ApproveAllSheet
+          view={confirmAll.view}
+          open={confirmAll.open}
+          busy={busy}
+          onOpenChange={(open) => setConfirmAll((sheet) => (sheet ? { ...sheet, open } : sheet))}
+          onConfirm={approveAll}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (confirmReturnsFocus.current) focusOpener("approve-all");
+          }}
+        />
+      ) : null}
+      {rejectBox && rejectLine ? (
+        <RejectSheet
+          key={rejectBox.opened}
+          open={rejectBox.open}
+          onOpenChange={(open) => {
+            if (!open) closeReject(true);
+          }}
+          itemTitle={lineTitle(rejectLine)}
+          version={rejectBox.version}
+          lastChoiceId={rejectBox.lastChoiceId}
+          draft={draftOf(rejectBox.lineId)}
+          onDraftChange={(draft) => saveDraft(rejectBox.lineId, draft)}
+          sending={busy === `reject:${rejectBox.lineId}`}
+          disabled={busy !== null}
+          onSubmit={(form) => submitReject(rejectBox, rejectLine, form)}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (rejectReturnsFocus.current) focusOpener(controlId("reject", rejectBox.lineId));
+          }}
+        />
+      ) : null}
       <p className="sr-only" role="status" aria-live="polite">
         {announcement}
       </p>

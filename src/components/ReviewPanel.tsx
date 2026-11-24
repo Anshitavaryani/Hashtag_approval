@@ -1,50 +1,84 @@
 "use client";
 
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
-import { ArrowRight, Check, ChevronLeft, ChevronRight, CircleCheck, Clock, Info, LayoutGrid, Loader2, PencilLine, Undo2 } from "lucide-react";
+import { useState, type MouseEvent, type ReactNode, type RefObject } from "react";
+import {
+  ArrowRight,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  CircleCheck,
+  CircleX,
+  Clock,
+  CornerUpLeft,
+  Info,
+  LayoutGrid,
+  Loader2,
+  Undo2,
+  X,
+} from "lucide-react";
 
 import { ImageStage } from "@/components/ImageStage";
 import { ImageViewer } from "@/components/ImageViewer";
 import { LineHistory } from "@/components/LineHistory";
-import { NoteSheet } from "@/components/NoteSheet";
-import { NotesList } from "@/components/NotesList";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Thumb } from "@/components/Thumb";
+import { VersionList } from "@/components/VersionList";
 import { Button } from "@/components/ui/button";
 import { formatTime, isoTime } from "@/lib/format";
-import { lineOptions, lineTitle, mainVersion, versionImages, versionName } from "@/lib/lines";
-import type { Outcome } from "@/lib/outcome";
-import { isSent, type Line, type Note, type Version, type ViewerImage } from "@/lib/types";
+import {
+  goBackDetail,
+  goBackLabel,
+  lineOptions,
+  lineTitle,
+  mainVersion,
+  newerVersions,
+  versionImages,
+  versionName,
+} from "@/lib/lines";
+import { isSent, type Actions, type Line, type Note, type Version, type ViewerImage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 export interface LineActions {
-  approve: (line: Line, version: number) => Promise<Outcome>;
-  undo: (line: Line) => Promise<Outcome>;
-  addNote: (line: Line, form: FormData) => Promise<Outcome>;
-  toggleNote: (note: Note) => Promise<Outcome>;
+  /** Approve the newest version, or go back to an older one. */
+  approve: (line: Line, version: number) => void;
+  /** Opens the Reject box for the newest version. */
+  reject: (line: Line) => void;
+  /** Takes back the item's last choice. */
+  undo: (line: Line) => void;
+  /** Goes on after a choice: to the item `to`, or back to the list (null). */
+  next: (line: Line, to: number | null) => void;
 }
 
-/** Where to go once this item is approved: the next item waiting, or back to the list (`back`). */
-export type NextStep = { label: string; go: () => void; back?: boolean } | null;
+/** Where to go after a choice: the next item waiting (`to`), or back to the list (null). */
+export type NextStep = { label: string; to: number | null } | null;
+
+/** The id of an item's control that focus moves to once an action answers or a box closes (CHANGES-24NOV 7.4). */
+export const controlId = (control: "heading" | "approve" | "reject" | "go-back" | "undo" | "outcome", lineId: number) =>
+  control === "heading" ? `review-${lineId}` : `${control}-${lineId}`;
+
+const NOTHING: Actions = { approve: false, reject: false, go_back_to: [], undo: false };
 
 type Viewer =
   | { kind: "version"; version: number; index: number }
   | { kind: "artwork"; index: number }
-  | { kind: "photos"; eventId: number; index: number };
+  | { kind: "pictures"; eventId: number; index: number };
 
 /**
- * The focused review of one item: its options, the artwork preview of the version on screen
- * (with the team's message), Approve artwork / Request changes, the customer's notes and the
- * item's history.
+ * The focused review of one item: its options, the artwork preview of the version on screen with
+ * the team's message, the item's versions and where each stands, and one decision: Approve or
+ * Reject the newest version, or Go back to an earlier one; after a choice, what was chosen and
+ * Undo. Then the customer's uploaded artwork and the item's history.
  *
- * split: the picture and the decision side by side (wide screens). stack: one column, with the
- * decision kept in reach at the bottom of the screen while the item is in view (phones).
+ * split: the picture beside a column with the versions and the decision (wide screens). stack:
+ * one column, with the decision kept in reach at the bottom of the screen (phones). Either way
+ * Approve / Reject (or the outcome with Undo) come first and Go back under them.
  */
 export function ReviewPanel({
   line,
   position,
   readOnly,
   busy,
+  paused,
   actions,
   layout,
   framed = true,
@@ -57,6 +91,8 @@ export function ReviewPanel({
   position?: { index: number; total: number };
   readOnly: boolean;
   busy: string | null;
+  /** For a moment after an action on this item answered, its buttons ignore presses (ApprovalApp). */
+  paused: boolean;
   actions: LineActions;
   layout: "split" | "stack";
   /** Drawn as a card; the full-screen review on phones has its own frame. */
@@ -68,107 +104,228 @@ export function ReviewPanel({
 }) {
   const title = lineTitle(line);
   const sent = isSent(line);
-  const writable = sent && !readOnly;
   const split = layout === "split";
+  const newest = line.current_version;
+  // Buttons come only from the API's `actions`, never worked out here; none while read-only.
+  const offers = sent && !readOnly ? line.actions : NOTHING;
+  const choice = sent ? line.last_choice : null;
+  const phase = !choice ? "waiting" : choice.kind === "REJECTED" ? "rejected" : choice.kind === "WENT_BACK" ? "went-back" : "approved";
 
-  // The version on screen: the approved one while it stands, else the newest, unless the customer picked another.
-  const [picked, setPicked] = useState<number | null>(null);
-  const shown = line.versions.find((v) => v.version === picked) ?? mainVersion(line);
-  const [imageIndex, setImageIndex] = useState(0);
+  // The version on screen: the default one (the approved one while it stands, else the newest), or
+  // the one the customer opened in the list since their last choice. A choice or an Undo shows the
+  // default again, so after going back the version gone back to is on screen.
+  const since = line.last_choice?.event_id ?? null;
+  const [picked, setPicked] = useState<{ version: number; since: number | null } | null>(null);
+  const shown =
+    (picked && picked.since === since ? line.versions.find((v) => v.version === picked.version) : undefined) ?? mainVersion(line);
+  const shownVersion = shown?.version ?? null;
+  const [image, setImage] = useState({ version: 0, index: 0 });
+  const imageIndex = image.version === shownVersion ? image.index : 0;
   const images = shown ? versionImages(line, shown) : [];
-  const many = line.versions.length > 1;
-
   const [viewer, setViewer] = useState<Viewer | null>(null);
-  const [noteOpen, setNoteOpen] = useState(false);
-  const [about, setAbout] = useState<number | null>(null);
+  const showVersion = (version: number) => setPicked({ version, since });
 
-  // After Approve the Undo button takes focus, and the other way round, so keyboard and
-  // screen-reader users aren't dropped at the top of the page when the button they used goes away.
-  const approveButton = useRef<HTMLButtonElement>(null);
-  const undoButton = useRef<HTMLButtonElement>(null);
-  const focusNext = useRef<"approve" | "undo" | null>(null);
-  const [, setFocusRequest] = useState(0);
-  useEffect(() => {
-    if (!focusNext.current) return;
-    const target = focusNext.current === "undo" ? undoButton.current : approveButton.current;
-    target?.focus();
-    focusNext.current = null;
-  });
-  // One more render after the ref is set, so the effect above runs with the new buttons.
-  const moveFocus = (to: "approve" | "undo") => {
-    focusNext.current = to;
-    setFocusRequest((n) => n + 1);
-  };
+  const onNewest = shownVersion === newest;
+  const earlier = sent && shownVersion !== null && shownVersion < newest;
+  // Go back goes to the version on screen, or to the one before the newest while the newest is on screen.
+  const goBackTo =
+    shownVersion !== null && offers.go_back_to.includes(shownVersion)
+      ? shownVersion
+      : onNewest
+        ? (offers.go_back_to[0] ?? null)
+        : null;
+  const busyWith = (what: string) => busy === `${what}:${line.id}`;
+  // A press ignored during the pause doesn't move focus either, so it stays where the answer put it.
+  const holdFocus = paused ? (event: MouseEvent) => event.preventDefault() : undefined;
 
-  const approve = async (version: number) => {
-    const outcome = await actions.approve(line, version);
-    if (outcome.status === "done") moveFocus("undo");
-  };
-  const undo = async () => {
-    const outcome = await actions.undo(line);
-    if (outcome.status === "done") moveFocus("approve");
-  };
-  const showVersion = (version: number) => {
-    setPicked(version);
-    setImageIndex(0);
-  };
-  const requestChanges = (fileId: number | null) => {
-    setAbout(fileId);
-    setNoteOpen(true);
-  };
+  // ---- the pieces --------------------------------------------------------------------------
 
-  const viewerImages: ViewerImage[] = (() => {
-    if (!viewer) return [];
-    if (viewer.kind === "artwork") {
-      const count = line.customer_artwork.length;
-      return line.customer_artwork.map((a, i) => ({ src: a.url, alt: `Your uploaded artwork, ${i + 1} of ${count}` }));
-    }
-    if (viewer.kind === "photos") {
-      const note = line.notes.find((n) => n.event_id === viewer.eventId);
-      return (note?.pictures ?? []).map((p, i, all) => ({ src: p.url, alt: `Your photo, ${i + 1} of ${all.length}` }));
-    }
-    const version = line.versions.find((v) => v.version === viewer.version);
-    return version ? versionImages(line, version) : [];
-  })();
-  const viewerTitle =
-    viewer?.kind === "artwork"
-      ? "Your uploaded artwork"
-      : viewer?.kind === "photos"
-        ? "Your photos"
-        : `${title} · ${viewer ? versionName(line, viewer.version) : ""}`;
-  const viewerAction =
-    viewer?.kind === "version" && writable && viewer.version === shown?.version
-      ? (index: number) => (
-          <Button
-            variant="secondary"
-            onClick={() => {
-              setViewer(null);
-              requestChanges(images.length > 1 ? (shown?.files[index]?.id ?? null) : null);
-            }}
-          >
-            <PencilLine aria-hidden />
-            {images.length > 1 ? "Request changes to this image" : "Request changes"}
-          </Button>
-        )
-      : undefined;
-
-  const decision =
-    shown && sent ? (
-      <Decision
-        line={line}
-        version={shown.version}
-        readOnly={readOnly}
-        busy={busy}
-        compact={!split}
-        onApprove={approve}
-        onUndo={undo}
-        onRequest={() => requestChanges(null)}
-        onShowVersion={showVersion}
-        next={next}
-        approveButton={approveButton}
-        undoButton={undoButton}
-      />
+  // An earlier version on screen says so, except the one the customer went back to: the outcome says that.
+  const decided = phase === "approved" || phase === "went-back";
+  const callout =
+    earlier && !(phase === "went-back" && shownVersion === choice?.version) ? (
+      <Callout tone="waiting" icon={<Info className="size-4" aria-hidden />}>
+        {decided && !readOnly ? "This is an earlier version. To choose it instead, first press Undo." : "This is an earlier version."}{" "}
+        <TextButton onClick={() => showVersion(newest)}>See the newest, Version {newest}</TextButton>
+      </Callout>
     ) : null;
+
+  const approving = busyWith("approve");
+  const approveButton = offers.approve ? (
+    <Button
+      id={controlId("approve", line.id)}
+      size="lg"
+      className="w-full px-3"
+      disabled={busy !== null}
+      onMouseDown={holdFocus}
+      onClick={() => actions.approve(line, newest)}
+    >
+      {approving ? <Loader2 className="animate-spin" aria-hidden /> : <Check aria-hidden />}
+      {approving ? "Approving…" : "Approve"}
+    </Button>
+  ) : null;
+  const rejectButton = offers.reject ? (
+    <Button
+      id={controlId("reject", line.id)}
+      variant="outline"
+      size="lg"
+      className="w-full px-3"
+      disabled={busy !== null}
+      onMouseDown={holdFocus}
+      onClick={() => actions.reject(line)}
+    >
+      <X aria-hidden />
+      Reject
+    </Button>
+  ) : null;
+
+  const undoing = busyWith("undo");
+  const undoButton = offers.undo ? (
+    <Button
+      id={controlId("undo", line.id)}
+      variant="outline"
+      aria-label={`Undo your last choice on ${title}`}
+      className={cn("shrink-0 bg-card px-3.5", phase !== "rejected" && "border-success/40")}
+      disabled={busy !== null}
+      onMouseDown={holdFocus}
+      onClick={() => actions.undo(line)}
+    >
+      {undoing ? <Loader2 className="animate-spin" aria-hidden /> : <Undo2 aria-hidden />}
+      {undoing ? "Undoing…" : "Undo"}
+    </Button>
+  ) : null;
+  const undoHint = offers.undo ? (
+    <p className="text-xs leading-relaxed text-muted-foreground">Undo takes back your last choice, until we start production.</p>
+  ) : null;
+  const nextButton =
+    choice && !readOnly && next ? (
+      <Button size="lg" className="w-full" onMouseDown={holdFocus} onClick={() => actions.next(line, next.to)}>
+        {next.to === null ? <LayoutGrid aria-hidden /> : null}
+        {next.label}
+        {next.to === null ? null : <ArrowRight aria-hidden />}
+      </Button>
+    ) : null;
+
+  // What the customer chose, in one line (the focus lands on it when nothing else fits).
+  const headline = choice ? (
+    <p id={controlId("outcome", line.id)} tabIndex={-1} className="flex min-w-0 items-start gap-1.5 leading-5 font-semibold outline-none">
+      {phase === "rejected" ? (
+        <CircleX className="mt-0.5 size-4 shrink-0" aria-hidden />
+      ) : phase === "went-back" ? (
+        <CornerUpLeft className="mt-0.5 size-4 shrink-0" aria-hidden />
+      ) : (
+        <CircleCheck className="mt-0.5 size-4 shrink-0" aria-hidden />
+      )}
+      <span>
+        {phase === "rejected" ? "You rejected" : phase === "went-back" ? "You went back to" : "You approved"}{" "}
+        <span className="whitespace-nowrap">{versionName(choice.version)}</span>
+      </span>
+    </p>
+  ) : null;
+  // The rejection: the customer's own note and pictures (the note of this choice; the version's as a fallback).
+  const note =
+    choice && phase === "rejected"
+      ? (line.notes.find((n) => n.event_id === choice.event_id) ??
+        line.versions.find((v) => v.version === choice.version)?.note ??
+        null)
+      : null;
+  const details =
+    choice && phase === "rejected" ? (
+      <>
+        {note?.body ? <NoteText text={note.body} /> : null}
+        {note && note.pictures.length > 0 ? (
+          <NotePictures note={note} onOpen={(index) => setViewer({ kind: "pictures", eventId: note.event_id, index })} />
+        ) : null}
+        <p>We&apos;ll make the changes and send you a new version.</p>
+      </>
+    ) : choice && phase === "went-back" ? (
+      <>
+        <p>
+          {versionName(choice.version)} is approved, and {newerVersions(choice.version, newest)}{" "}
+          {choice.version + 1 >= newest ? "is" : "are"} rejected.
+        </p>
+        {shownVersion !== choice.version ? (
+          <TextButton tone="success" onClick={() => showVersion(choice.version)}>
+            Show {versionName(choice.version)}
+          </TextButton>
+        ) : null}
+      </>
+    ) : null;
+  const tone = phase === "rejected" ? "border-border bg-surface" : "border-success/30 bg-success-soft text-success";
+
+  // The whole outcome in one box, as wide screens show it (phones too, when an earlier version is
+  // on screen): "You rejected Version 2 [Undo]", when, then the details. Undo keeps its place beside
+  // the sentence whatever was chosen, so a second press of a double click lands on an Undo too.
+  const outcomeBox = choice ? (
+    <div className={cn("space-y-2.5 rounded-xl border px-3.5 py-3 text-sm leading-relaxed", tone)}>
+      <div>
+        <div className="flex items-center justify-between gap-3">
+          {headline}
+          {undoButton}
+        </div>
+        {/* On phones the time is in the item's history, so the outcome stays short. */}
+        {split && choice.at ? (
+          <time dateTime={isoTime(choice.at)} className="block text-xs">
+            {formatTime(choice.at)}
+          </time>
+        ) : null}
+      </div>
+      {details}
+    </div>
+  ) : null;
+
+  const decision = !sent ? null : choice ? (
+    <div className="space-y-3">
+      {outcomeBox}
+      {undoHint}
+      {nextButton}
+    </div>
+  ) : offers.approve && onNewest ? (
+    <div className="space-y-3">
+      <div className="grid gap-2">
+        {approveButton}
+        {rejectButton}
+      </div>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        Approving means we&apos;ll make this item exactly as shown. Not quite right? Choose Reject and tell us what to change.
+      </p>
+    </div>
+  ) : readOnly ? (
+    <Callout icon={<Info className="size-4" aria-hidden />}>This item can&apos;t be changed any more.</Callout>
+  ) : null; // An earlier version on screen: the callout and Go back are the action.
+
+  const goingBack = busyWith("go-back");
+  const goBackId = controlId("go-back", line.id);
+  const goBackButton =
+    goBackTo !== null ? (
+      <Button
+        id={goBackId}
+        variant="outline"
+        className="h-auto w-full flex-col gap-0.5 px-4 py-2.5 text-center whitespace-normal"
+        aria-labelledby={`${goBackId}-label`}
+        aria-describedby={`${goBackId}-detail`}
+        disabled={busy !== null}
+        onMouseDown={holdFocus}
+        onClick={() => actions.approve(line, goBackTo)}
+      >
+        <span className="flex items-center gap-2 font-semibold">
+          {goingBack ? <Loader2 className="animate-spin" aria-hidden /> : <CornerUpLeft aria-hidden />}
+          <span id={`${goBackId}-label`}>{goingBack ? "Going back…" : goBackLabel(goBackTo)}</span>
+        </span>
+        <span id={`${goBackId}-detail`} className="text-xs font-normal text-balance text-muted-foreground">
+          {goBackDetail(goBackTo, newest)}
+        </span>
+      </Button>
+    ) : null;
+  const goBackBlock = goBackButton ? (
+    <div className="space-y-1.5">
+      {goBackButton}
+      {onNewest && newest >= 3 ? (
+        <p className="text-xs leading-relaxed text-muted-foreground">To go back further, open that version in the list above.</p>
+      ) : null}
+    </div>
+  ) : null;
+
   const noPreviewNote =
     shown && line.status === "NO_PROOF_NEEDED" ? (
       <Callout icon={<CircleCheck className="size-4" aria-hidden />}>
@@ -179,18 +336,91 @@ export function ReviewPanel({
     <ImageStage
       images={images}
       index={imageIndex}
-      onIndexChange={setImageIndex}
+      onIndexChange={(index) => setImage({ version: shown.version, index })}
       onEnlarge={(index) => setViewer({ kind: "version", version: shown.version, index })}
     />
   ) : (
     <Placeholder line={line} readOnly={readOnly} />
   );
+  const versions = shown ? <VersionList line={line} readOnly={readOnly} shown={shown.version} onSelect={showVersion} /> : null;
   const artwork = <UploadedArtwork line={line} onOpen={(index) => setViewer({ kind: "artwork", index })} />;
-  // The switcher's tabs control everything below them that belongs to the version on screen.
-  const tabPanel =
-    many && shown
-      ? { role: "tabpanel", id: `versions-${line.id}-panel`, "aria-labelledby": `versions-${line.id}-tab-${shown.version}` }
-      : {};
+
+  // Phones (CHANGES-24NOV 7.4): what sits just above the sticky area, in it, and just below it.
+  let above: ReactNode = null;
+  let sticky: ReactNode = null;
+  let below: ReactNode = null;
+  if (!sent || readOnly) {
+    above = (
+      <>
+        {callout}
+        {decision}
+      </>
+    );
+  } else if (!choice && onNewest && (approveButton || rejectButton)) {
+    sticky = (
+      <div className="grid grid-cols-2 gap-2">
+        {rejectButton}
+        {approveButton}
+      </div>
+    );
+    below = goBackBlock;
+  } else if (earlier && goBackButton && (phase === "waiting" || phase === "rejected")) {
+    above = (
+      <>
+        {callout}
+        {phase === "rejected" ? decision : null}
+      </>
+    );
+    sticky = goBackButton;
+  } else if (choice) {
+    above = (
+      <>
+        {callout}
+        {details ? <div className={cn("space-y-2 rounded-xl px-3.5 py-3 text-sm leading-relaxed", tone)}>{details}</div> : null}
+        {undoHint}
+      </>
+    );
+    // Row 2 sits where Approve and Reject were, so what appears there after a choice is never Undo.
+    sticky = (
+      <div className="space-y-2.5">
+        <div className="flex items-center justify-between gap-3">
+          <div className={cn("min-w-0 text-sm", phase !== "rejected" && "text-success")}>{headline}</div>
+          {undoButton}
+        </div>
+        {nextButton}
+      </div>
+    );
+    below = goBackBlock;
+  } else {
+    above = (
+      <>
+        {callout}
+        {decision}
+      </>
+    );
+    below = goBackBlock;
+  }
+
+  const viewerImages: ViewerImage[] = (() => {
+    if (!viewer) return [];
+    if (viewer.kind === "artwork") {
+      const count = line.customer_artwork.length;
+      return line.customer_artwork.map((a, i) => ({ src: a.url, alt: `Your uploaded artwork, ${i + 1} of ${count}` }));
+    }
+    if (viewer.kind === "pictures") {
+      const pictures = line.notes.find((n) => n.event_id === viewer.eventId)?.pictures ?? note?.pictures ?? [];
+      return pictures.map((p, i, all) => ({ src: p.url, alt: `Your picture ${i + 1} of ${all.length}` }));
+    }
+    const version = line.versions.find((v) => v.version === viewer.version);
+    return version ? versionImages(line, version) : [];
+  })();
+  const viewerTitle =
+    viewer?.kind === "artwork"
+      ? "Your uploaded artwork"
+      : viewer?.kind === "pictures"
+        ? "Your pictures"
+        : `${title} · ${viewer ? versionName(viewer.version) : ""}`;
+
   const pad = split ? "px-6 xl:px-7" : "px-4";
   // Beside the list (wide screens) the item's status sits in the "Item 2 of 5" row, so a long
   // name keeps the whole width and the artwork starts higher up. The heading still names it when focused.
@@ -229,7 +459,7 @@ export function ReviewPanel({
         <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
           <h2
             ref={headingRef}
-            id={`review-${line.id}`}
+            id={controlId("heading", line.id)}
             aria-describedby={topRow ? statusId : undefined}
             tabIndex={-1}
             className="min-w-0 flex-1 text-xl leading-snug font-semibold break-words outline-none sm:text-2xl"
@@ -239,15 +469,17 @@ export function ReviewPanel({
           {topRow ? null : status}
         </div>
         <Options line={line} />
-        {shown ? <VersionSwitcher line={line} selected={shown.version} onSelect={showVersion} /> : null}
       </header>
 
       {split && shown ? (
-        <div {...tabPanel} className={cn("grid gap-6 py-5 lg:grid-cols-[minmax(0,1fr)_250px] xl:grid-cols-[minmax(0,1fr)_300px]", pad)}>
+        <div className={cn("grid gap-6 py-5 lg:grid-cols-[minmax(0,1fr)_260px] xl:grid-cols-[minmax(0,1fr)_300px]", pad)}>
           <div className="min-w-0">{stage}</div>
-          <div className="space-y-5">
+          <div className="min-w-0 space-y-5">
+            {versions}
             <TeamMessage key={shown.version} version={shown} />
+            {callout}
             {decision ?? noPreviewNote}
+            {goBackBlock}
             {artwork}
           </div>
         </div>
@@ -257,31 +489,25 @@ export function ReviewPanel({
           {artwork}
         </div>
       ) : (
-        <div {...tabPanel} className={cn("space-y-4 py-4", pad)}>
+        <div className={cn("space-y-4 py-4", pad)}>
           {stage}
+          {versions}
           {shown ? <TeamMessage key={shown.version} version={shown} compact /> : null}
           {noPreviewNote}
-          {decision && writable ? (
+          {above}
+          {sticky ? (
             <div className="sticky bottom-0 z-10 -mx-4 border-t border-border/70 bg-card/95 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-6px_16px_-8px_rgb(28_28_25/0.15)] backdrop-blur">
-              {decision}
+              {sticky}
             </div>
-          ) : (
-            decision
-          )}
+          ) : null}
+          {below}
+          {artwork}
+          <LineHistory line={line} />
         </div>
       )}
 
-      {line.notes.length > 0 || line.history.length > 0 || (!split && line.customer_artwork.length > 0) ? (
-        <div className={cn("space-y-5 border-t border-border/70 py-5", pad)}>
-          <NotesList
-            line={line}
-            readOnly={readOnly}
-            busy={busy}
-            onToggle={(note) => actions.toggleNote(note)}
-            onShowPhotos={(note, index) => setViewer({ kind: "photos", eventId: note.event_id, index })}
-            onShowImage={(version, index) => setViewer({ kind: "version", version, index })}
-          />
-          {split ? null : artwork}
+      {split && line.history.length > 0 ? (
+        <div className={cn("border-t border-border/70 py-5", pad)}>
           <LineHistory line={line} />
         </div>
       ) : null}
@@ -293,29 +519,11 @@ export function ReviewPanel({
           if (!viewer) return;
           setViewer({ ...viewer, index });
           // Closing the viewer leaves the page on the image looked at last.
-          if (viewer.kind === "version" && viewer.version === shown?.version) setImageIndex(index);
+          if (viewer.kind === "version" && viewer.version === shownVersion) setImage({ version: viewer.version, index });
         }}
         onClose={() => setViewer(null)}
         title={viewerTitle}
-        action={viewerAction}
       />
-
-      {writable && shown ? (
-        <NoteSheet
-          open={noteOpen}
-          onOpenChange={setNoteOpen}
-          itemTitle={title}
-          version={shown.version}
-          versionLabel={versionName(line, shown.version)}
-          images={shown.files.map((file, i) => ({ fileId: file.id, src: images[i]?.src ?? file.url }))}
-          about={about}
-          onAboutChange={setAbout}
-          askUndo={line.status === "APPROVED"}
-          sending={busy === `add-note:${line.id}`}
-          disabled={busy !== null}
-          onSend={(form) => actions.addNote(line, form)}
-        />
-      ) : null}
     </article>
   );
 }
@@ -332,66 +540,6 @@ function Options({ line }: { line: Line }) {
         </li>
       ))}
     </ul>
-  );
-}
-
-/** "Version 2 (latest) | Version 1", the approved one marked. With one version there is nothing to switch. */
-function VersionSwitcher({ line, selected, onSelect }: { line: Line; selected: number; onSelect: (version: number) => void }) {
-  const tabs = useRef(new Map<number, HTMLButtonElement>());
-  // Newest first.
-  const versions = [...line.versions].reverse();
-  const approvedVersion = line.status === "APPROVED" ? line.approved_version : null;
-
-  if (versions.length < 2) return null;
-
-  const onKeyDown = (event: KeyboardEvent<HTMLButtonElement>, position: number) => {
-    const moves: Record<string, number> = { ArrowRight: position + 1, ArrowLeft: position - 1, Home: 0, End: versions.length - 1 };
-    if (!(event.key in moves)) return;
-    event.preventDefault();
-    const target = versions[(moves[event.key] + versions.length) % versions.length];
-    onSelect(target.version);
-    tabs.current.get(target.version)?.focus();
-  };
-
-  return (
-    <div
-      role="tablist"
-      aria-label={`Versions of ${lineTitle(line)}`}
-      className="flex max-w-full gap-1 overflow-x-auto rounded-xl bg-muted p-1 sm:inline-flex"
-    >
-      {versions.map((v, position) => {
-        const active = v.version === selected;
-        return (
-          <button
-            key={v.version}
-            ref={(node) => {
-              if (node) tabs.current.set(v.version, node);
-              else tabs.current.delete(v.version);
-            }}
-            type="button"
-            role="tab"
-            id={`versions-${line.id}-tab-${v.version}`}
-            aria-selected={active}
-            aria-controls={`versions-${line.id}-panel`}
-            tabIndex={active ? 0 : -1}
-            onClick={() => onSelect(v.version)}
-            onKeyDown={(event) => onKeyDown(event, position)}
-            className={cn(
-              "inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-lg px-3.5 text-sm font-semibold whitespace-nowrap transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-              active ? "bg-card text-foreground shadow-sm" : "text-muted-foreground hover:bg-card/60 hover:text-foreground",
-            )}
-          >
-            {versionName(line, v.version)}
-            {v.version === approvedVersion ? (
-              <span className="inline-flex items-center gap-0.5 rounded-full bg-success-soft px-1.5 py-0.5 text-[11px] text-success">
-                <Check className="size-3" aria-hidden />
-                Approved
-              </span>
-            ) : null}
-          </button>
-        );
-      })}
-    </div>
   );
 }
 
@@ -440,6 +588,59 @@ function TeamMessage({ version, compact = false }: { version: Version; compact?:
   );
 }
 
+/** The customer's note on a rejected version, folded to three lines when it is longer. */
+function NoteText({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const long = text.length > 140 || text.split("\n").length > 3;
+  return (
+    <div>
+      <blockquote className={cn("break-words whitespace-pre-wrap", long && !expanded && "line-clamp-3")}>“{text}”</blockquote>
+      {long ? (
+        <Button variant="link" className="-ml-2 px-2 text-xs" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+          {expanded ? "Show less" : "Show the whole note"}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+/** The pictures the customer added to a rejection, small; each opens full size. */
+function NotePictures({ note, onOpen }: { note: Note; onOpen: (index: number) => void }) {
+  const count = note.pictures.length;
+  return (
+    <ul className="flex flex-wrap gap-1.5" aria-label="Your pictures">
+      {note.pictures.map((picture, i) => (
+        <li key={`${picture.id}:${picture.url}`}>
+          <button
+            type="button"
+            onClick={() => onOpen(i)}
+            aria-label={`Show your picture ${i + 1} of ${count}`}
+            className="block size-14 overflow-hidden rounded-lg border border-border bg-card focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          >
+            <Thumb key={picture.url} src={picture.url} alt="" className="object-cover" />
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** A link-styled button inside a sentence, with a 44 px tall tap area that doesn't push the lines apart. */
+function TextButton({ tone, onClick, children }: { tone?: "success"; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        "-my-3 rounded py-3 text-left font-semibold underline underline-offset-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+        tone === "success" ? "text-success" : "text-primary-ink",
+      )}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
 function Callout({ icon, tone = "muted", children }: { icon: ReactNode; tone?: "muted" | "waiting"; children: ReactNode }) {
   return (
     <div
@@ -450,169 +651,6 @@ function Callout({ icon, tone = "muted", children }: { icon: ReactNode; tone?: "
     >
       <span className="mt-0.5 shrink-0">{icon}</span>
       <div className="min-w-0">{children}</div>
-    </div>
-  );
-}
-
-/** Approve artwork / Request changes, or the approval with Undo and the way on. */
-function Decision({
-  line,
-  version,
-  readOnly,
-  busy,
-  compact,
-  onApprove,
-  onUndo,
-  onRequest,
-  onShowVersion,
-  next,
-  approveButton,
-  undoButton,
-}: {
-  line: Line;
-  version: number;
-  readOnly: boolean;
-  busy: string | null;
-  /** Phones: buttons side by side, no extra hint. */
-  compact: boolean;
-  onApprove: (version: number) => void;
-  onUndo: () => void;
-  onRequest: () => void;
-  onShowVersion: (version: number) => void;
-  next: NextStep;
-  approveButton: RefObject<HTMLButtonElement | null>;
-  undoButton: RefObject<HTMLButtonElement | null>;
-}) {
-  const approved = line.status === "APPROVED" && line.approved_version !== null ? line.approved_version : null;
-  const approving = busy === `approve:${line.id}`;
-  const undoing = busy === `undo:${line.id}`;
-  const isLatest = version === line.current_version;
-  const approvedHere = approved === version;
-
-  const approvedBox =
-    approved !== null ? (
-      <div
-        className={cn(
-          "flex items-center justify-between gap-x-3 gap-y-2 rounded-xl border border-success/30 bg-success-soft px-3.5 py-2.5 text-success",
-          !compact && "flex-wrap",
-        )}
-      >
-        <p className="min-w-0 text-sm">
-          <span className="flex items-center gap-1.5 font-semibold">
-            <CircleCheck className="size-4 shrink-0" aria-hidden />
-            You approved Version {approved}
-          </span>
-          {/* On phones the bar stays short; the time is in the item's history. */}
-          {line.approved_at && !compact ? (
-            <time dateTime={isoTime(line.approved_at)} className="mt-0.5 block text-xs">
-              {formatTime(line.approved_at)}
-            </time>
-          ) : null}
-          {/* Not when the approved one is the latest and this is an older one: "See the latest" below goes there. */}
-          {!approvedHere && (readOnly || isLatest || approved !== line.current_version) ? (
-            <Button variant="link" className="-ml-2 px-2 text-xs text-success" onClick={() => onShowVersion(approved)}>
-              Show Version {approved}
-            </Button>
-          ) : null}
-        </p>
-        {!readOnly && line.undo_event_id !== null ? (
-          <Button
-            ref={undoButton}
-            variant="outline"
-            className="border-success/40 bg-card px-3.5"
-            disabled={busy !== null}
-            onClick={onUndo}
-          >
-            {undoing ? <Loader2 className="animate-spin" aria-hidden /> : <Undo2 aria-hidden />}
-            {undoing ? "Undoing…" : "Undo"}
-          </Button>
-        ) : null}
-      </div>
-    ) : null;
-
-  if (readOnly) {
-    return (
-      approvedBox ?? (
-        <Callout icon={<Info className="size-4" aria-hidden />}>This item can&apos;t be changed any more.</Callout>
-      )
-    );
-  }
-
-  const short = approved === null && isLatest;
-  // Side by side on phones (the main button on the right, where the thumb is), stacked with the main
-  // one first otherwise. Side by side, a phone drops the icons so both labels stay on one line: a
-  // 360 px screen leaves about 140 px per button.
-  const sideBySide = compact && (short || (approvedHere && next !== null));
-  const size = sideBySide ? "px-2.5 text-sm max-sm:[&_svg]:hidden" : compact ? "px-3 text-sm" : "";
-  const requestButton = (
-    <Button key="request" variant="outline" size="lg" className={cn("w-full", size)} disabled={busy !== null} onClick={onRequest}>
-      <PencilLine aria-hidden />
-      Request changes
-    </Button>
-  );
-  const mainButton = approvedHere ? (
-    next ? (
-      <Button key="next" size="lg" className={cn("w-full", size)} onClick={next.go}>
-        {next.back ? <LayoutGrid aria-hidden /> : null}
-        {next.label}
-        {next.back ? null : <ArrowRight aria-hidden />}
-      </Button>
-    ) : null
-  ) : (
-    // An older version is there to compare: approving it is possible, but never the main button.
-    <Button
-      key="approve"
-      ref={approveButton}
-      size="lg"
-      variant={isLatest ? "default" : "outline"}
-      className={cn("w-full", size)}
-      disabled={busy !== null}
-      onClick={() => onApprove(version)}
-    >
-      {approving ? <Loader2 className="animate-spin" aria-hidden /> : <Check aria-hidden />}
-      {approving
-        ? "Approving…"
-        : short
-          ? "Approve artwork"
-          : isLatest
-            ? `Approve Version ${version}`
-            : `Approve Version ${version} instead`}
-    </Button>
-  );
-
-  return (
-    <div className="space-y-3">
-      {approvedBox}
-
-      {approved === null && line.status === "CHANGES_REQUESTED" ? (
-        <Callout icon={<Info className="size-4" aria-hidden />}>
-          You asked for changes, so we&apos;ll send you an updated version. If you&apos;d rather go ahead with this one as it
-          is, you can still approve it.
-        </Callout>
-      ) : null}
-
-      {!isLatest && !approvedHere ? (
-        <Callout tone="waiting" icon={<Info className="size-4" aria-hidden />}>
-          This is an older version.{" "}
-          <button
-            type="button"
-            className="-my-3 rounded py-3 font-semibold text-primary-ink underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            onClick={() => onShowVersion(line.current_version)}
-          >
-            See the latest, Version {line.current_version}
-          </button>
-        </Callout>
-      ) : null}
-
-      <div className={cn("grid gap-2", sideBySide && "grid-cols-2")}>
-        {sideBySide ? [requestButton, mainButton] : [mainButton, requestButton]}
-      </div>
-      {compact || approvedHere ? null : (
-        <p className="text-xs leading-relaxed text-muted-foreground">
-          Approving means we&apos;ll make this item exactly as shown. Not quite right? Choose Request changes and tell us
-          what to change.
-        </p>
-      )}
     </div>
   );
 }
@@ -654,7 +692,7 @@ function UploadedArtwork({ line, onOpen }: { line: Line; onOpen: (index: number)
               type="button"
               onClick={() => onOpen(i)}
               aria-label={`Show your uploaded artwork ${i + 1} of ${count}`}
-              className="block size-14 overflow-hidden rounded-lg border border-border bg-surface p-0.5 transition hover:border-input focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="block size-14 overflow-hidden rounded-lg border border-border bg-surface p-0.5 transition hover:border-input focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
             >
               <Thumb key={art.url} src={art.url} alt="" className="rounded-md" />
             </button>

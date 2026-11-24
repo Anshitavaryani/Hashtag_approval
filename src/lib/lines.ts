@@ -1,8 +1,9 @@
 // What the page shows about one item (line): its name and options, its pictures, where it
 // stands, and which item to look at next. Pure functions of the view, no state.
-// Customer wording (CONTRACT section 12): "artwork preview", "Version 2 (latest)", never "proof".
+// Customer wording (CHANGES-24NOV section 8): "artwork preview", "Version 2", Approve, Reject,
+// Go back, Undo; never "proof".
 import { decodeEntities, prettyOption } from "./format";
-import { isSent, type Line, type Note, type PublicView, type Version, type ViewerImage } from "./types";
+import { isSent, type Line, type PublicView, type Version, type ViewerImage } from "./types";
 
 export const lineTitle = (line: Line) => decodeEntities(line.title) || "Item";
 
@@ -18,8 +19,8 @@ export function lineOptions(line: Line): { label: string; value: string }[] {
 }
 
 /**
- * An item waiting for the customer: a sent artwork preview that isn't approved and has no open
- * request for changes (after asking for changes, it's our turn).
+ * An item waiting for the customer: a sent artwork preview with nothing chosen on it yet
+ * (after a rejection, it's our turn).
  */
 export const needsReview = (line: Line) => isSent(line) && line.status === "WAITING";
 
@@ -38,9 +39,19 @@ export function coverImage(line: Line): string | null {
   return file ? file.preview_url || file.url : null;
 }
 
-/** "Version 2 (latest)" once there is more than one version, otherwise "Version 1". */
-export const versionName = (line: Line, version: number) =>
-  version === line.current_version && line.versions.length > 1 ? `Version ${version} (latest)` : `Version ${version}`;
+/** "Version 2". The newest one is marked "New" in the list of versions, not in its name. */
+export const versionName = (version: number) => `Version ${version}`;
+
+/** The versions after k up to the newest: "Version 2", "Versions 2 and 3" or "Versions 2 to 4". */
+export function newerVersions(k: number, newest: number): string {
+  if (newest <= k + 1) return `Version ${k + 1}`;
+  if (newest === k + 2) return `Versions ${k + 1} and ${newest}`;
+  return `Versions ${k + 1} to ${newest}`;
+}
+
+/** The Go back button's two lines: what it is, and what it does. */
+export const goBackLabel = (k: number) => `Go back to Version ${k}`;
+export const goBackDetail = (k: number, newest: number) => `Approves Version ${k} and rejects ${newerVersions(k, newest)}`;
 
 const isRaster = (mime: string, name: string) => /^image\/(png|jpe?g)$/i.test(mime) || /\.(png|jpe?g)$/i.test(name);
 
@@ -68,10 +79,9 @@ export function lineStatus(line: Line, readOnly: boolean): { label: string; tone
     case "APPROVED":
       return { label: "Approved", tone: "success" };
     case "CHANGES_REQUESTED":
-      return { label: "Changes requested", tone: "progress" };
+      return { label: "Rejected", tone: "progress" };
     case "WAITING":
-      if (readOnly) return { label: "Not approved", tone: "progress" };
-      return { label: line.current_version > 1 ? "Updated artwork" : "Needs your review", tone: "waiting" };
+      return readOnly ? { label: "Not approved", tone: "progress" } : { label: "Waiting for you", tone: "waiting" };
     case "NO_PROOF_NEEDED":
       return { label: "No preview needed", tone: "progress" };
     default:
@@ -87,27 +97,4 @@ export function nextToReview(lines: Line[], fromId: number | null): Line | null 
   const start = lines.findIndex((line) => line.id === fromId);
   const ordered = start < 0 ? lines : [...lines.slice(start + 1), ...lines.slice(0, start)];
   return ordered.find(needsReview) ?? null;
-}
-
-/**
- * The version we sent after a note, or null while the note is still open. Once a newer version
- * is sent, the notes before it no longer ask for changes (CONTRACT section 3, rules 2 and 6). Read
- * from the event order, not the note's version: a note on an older version written after the
- * newest one was sent is still open.
- */
-export function answeredBy(line: Line, note: Pick<Note, "event_id">): number | null {
-  const later = line.history
-    .filter((entry) => entry.type === "VERSION_SENT" && entry.event_id > note.event_id && entry.version !== null)
-    .map((entry) => entry.version as number);
-  return later.length > 0 ? Math.min(...later) : null;
-}
-
-/** Where a note's image sits among its version's pictures, e.g. { version: 2, index: 1 } for "About image 2". */
-export function noteImage(line: Line, note: Pick<Note, "version" | "file_id">) {
-  if (note.file_id === null) return null;
-  const version =
-    line.versions.find((v) => v.version === note.version && v.files.some((f) => f.id === note.file_id)) ??
-    line.versions.find((v) => v.files.some((f) => f.id === note.file_id));
-  const index = version ? version.files.findIndex((f) => f.id === note.file_id) : -1;
-  return version && index >= 0 ? { version: version.version, index } : null;
 }

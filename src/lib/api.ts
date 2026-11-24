@@ -1,7 +1,19 @@
 // Calls to the backend's public approval API (/api/v1/approval). The token travels in
 // the X-Approval-Token header only, never in a URL. Plain fetch: no cookies, no cache.
 import { API_URL } from "./config";
-import type { ApprovalStatus, Line, LineStatus, Note, ProofFile, PublicView, ReadOnlyReason, Version } from "./types";
+import type {
+  Actions,
+  ApprovalStatus,
+  HistoryEntry,
+  LastChoice,
+  Line,
+  LineStatus,
+  Note,
+  ProofFile,
+  PublicView,
+  ReadOnlyReason,
+  Version,
+} from "./types";
 
 export const INVALID_LINK = "This link isn't valid any more. Please ask us for a new one.";
 const NETWORK = "We couldn't reach our server. Check your internet connection and try again.";
@@ -100,22 +112,24 @@ const id = (value: number) => encodeURIComponent(String(value));
 
 export const approvalApi = {
   view: (token: string, signal?: AbortSignal) => call(token, "", "GET", { signal }),
-  approve: (token: string, lineId: number, version: number, latest: number) =>
-    call(token, `/lines/${id(lineId)}/approve`, "POST", { json: { version, latest } }),
+  /**
+   * Approve (version = the newest) or Go back (an older version). `latest` and `lastChoiceId` are what the
+   * page showed, so the API can refuse a click made on an out-of-date page.
+   */
+  approve: (token: string, lineId: number, version: number, latest: number, lastChoiceId: number | null) =>
+    call(token, `/lines/${id(lineId)}/approve`, "POST", { json: { version, latest, last_choice_id: lastChoiceId } }),
   approveAll: (token: string, lines: { id: number; latest: number }[]) =>
     call(token, "/approve-all", "POST", { json: { lines } }),
   undo: (token: string, target: { event_id: number } | { batch_id: string }) =>
     call(token, "/undo", "POST", { json: target }),
   // Up to five 10 MB pictures from a phone can take a while.
-  addNote: (token: string, lineId: number, form: FormData) =>
-    call(token, `/lines/${id(lineId)}/notes`, "POST", { form, timeout: 600_000 }),
-  removeNote: (token: string, eventId: number) => call(token, `/notes/${id(eventId)}/remove`, "POST"),
-  restoreNote: (token: string, eventId: number) => call(token, `/notes/${id(eventId)}/restore`, "POST"),
+  reject: (token: string, lineId: number, form: FormData) =>
+    call(token, `/lines/${id(lineId)}/reject`, "POST", { form, timeout: 600_000 }),
 };
 
 // ---------------------------------------------------------------------------
-// Reading the view. The API's shape is in CONTRACT section 5; this reads it
-// defensively (ids may arrive as strings from BIGINT columns, lists may be
+// Reading the view. The API's shape is in CHANGES-24NOV section 4.2; this reads
+// it defensively (ids may arrive as strings from BIGINT columns, lists may be
 // missing) so one odd field can't blank the customer's page.
 // ---------------------------------------------------------------------------
 
@@ -148,6 +162,9 @@ function fileUrl(value: unknown): string {
 const LINE_STATUSES = ["NOT_SENT", "NO_PROOF_NEEDED", "WAITING", "CHANGES_REQUESTED", "APPROVED"] as const;
 const APPROVAL_STATUSES = ["DRAFT", "WAITING", "CHANGES_REQUESTED", "APPROVED"] as const;
 const REASONS = ["LOCKED", "SHIPPED", "CANCELLED"] as const;
+const VERSION_STATUSES = ["WAITING", "APPROVED", "REJECTED", "REPLACED"] as const;
+const CHOICE_KINDS = ["APPROVED", "REJECTED", "WENT_BACK"] as const;
+const HISTORY_KINDS = ["SENT", "APPROVED", "WENT_BACK", "REJECTED", "UNDID_APPROVAL", "UNDID_GO_BACK", "UNDID_REJECTION"] as const;
 
 function toFile(raw: unknown): ProofFile | null {
   const f = record(raw);
@@ -157,7 +174,7 @@ function toFile(raw: unknown): ProofFile | null {
   return { id: fileId, url, preview_url: fileUrl(f.preview_url) || null, name: text(f.name) ?? "", mime: text(f.mime) ?? "" };
 }
 
-function toVersion(raw: unknown): Version | null {
+function toVersion(raw: unknown, newest: number): Version | null {
   const v = record(raw);
   const version = int(v.version);
   if (version === null || version < 1) return null;
@@ -166,6 +183,11 @@ function toVersion(raw: unknown): Version | null {
     sent_at: text(v.sent_at),
     message: text(v.message),
     files: array(v.files).map(toFile).filter((f): f is ProofFile => f !== null),
+    // An unknown status reads as the one that fits: the newest is waiting, an older one was replaced.
+    status: oneOf(v.status, VERSION_STATUSES) ?? (version === newest ? "WAITING" : "REPLACED"),
+    decided_at: text(v.decided_at),
+    went_back_to: int(v.went_back_to),
+    note: toNote(v.note),
   };
 }
 
@@ -178,11 +200,49 @@ function toNote(raw: unknown): Note | null {
     body: text(n.body),
     created_at: text(n.created_at),
     version: int(n.version),
-    file_id: int(n.file_id),
     removed: flag(n.removed),
     pictures: array(n.pictures)
       .map((p) => ({ id: int(record(p).id) ?? 0, url: fileUrl(record(p).url) }))
       .filter((p) => p.url),
+  };
+}
+
+function toLastChoice(raw: unknown): LastChoice | null {
+  const c = record(raw);
+  const eventId = int(c.event_id);
+  const kind = oneOf(c.kind, CHOICE_KINDS);
+  const version = int(c.version);
+  if (eventId === null || kind === null || version === null || version < 1) return null;
+  return { event_id: eventId, kind, version, at: text(c.at), batch_id: text(c.batch_id) };
+}
+
+/** Missing actions offer nothing; only versions older than the newest can be gone back to. */
+function toActions(raw: unknown, newest: number): Actions {
+  const a = record(raw);
+  const older = array(a.go_back_to)
+    .map(int)
+    .filter((v): v is number => v !== null && v >= 1 && v < newest);
+  return {
+    approve: flag(a.approve),
+    reject: flag(a.reject),
+    go_back_to: [...new Set(older)].sort((x, y) => y - x),
+    undo: flag(a.undo),
+  };
+}
+
+/** A history entry the page can put into words, or null (the API only sends those, but an odd one is left out). */
+function toHistoryEntry(raw: unknown): HistoryEntry | null {
+  const e = record(raw);
+  const kind = oneOf(e.kind, HISTORY_KINDS);
+  if (kind === null) return null;
+  return {
+    event_id: int(e.event_id) ?? 0,
+    type: text(e.type) ?? "",
+    kind,
+    version: int(e.version),
+    created_at: text(e.created_at),
+    batch_id: text(e.batch_id),
+    undone: flag(e.undone),
   };
 }
 
@@ -210,7 +270,7 @@ function toLine(raw: unknown): Line {
     approved_version: int(l.approved_version),
     approved_at: text(l.approved_at),
     versions: array(l.versions)
-      .map(toVersion)
+      .map((v) => toVersion(v, currentVersion))
       .filter((v): v is Version => v !== null)
       .sort((a, b) => a.version - b.version),
     notes: array(l.notes)
@@ -218,18 +278,11 @@ function toLine(raw: unknown): Line {
       .filter((n): n is Note => n !== null)
       .sort((a, b) => a.event_id - b.event_id),
     history: array(l.history)
-      .map((h) => {
-        const e = record(h);
-        return {
-          event_id: int(e.event_id) ?? 0,
-          type: text(e.type) ?? "",
-          version: int(e.version),
-          created_at: text(e.created_at),
-          batch_id: text(e.batch_id),
-          undone: flag(e.undone),
-        };
-      })
+      .map(toHistoryEntry)
+      .filter((h): h is HistoryEntry => h !== null)
       .sort((a, b) => b.event_id - a.event_id),
+    last_choice: toLastChoice(l.last_choice),
+    actions: toActions(l.actions, currentVersion),
     undo_event_id: int(l.undo_event_id),
   };
 }
@@ -255,6 +308,8 @@ function toView(raw: unknown): PublicView | null {
     },
     support_email: text(data.support_email)?.trim() || null,
     lines: data.lines.map(toLine),
-    last_batch: batchId ? { batch_id: batchId, undoable: flag(lastBatch.undoable) } : null,
+    last_batch: batchId
+      ? { batch_id: batchId, undoable: flag(lastBatch.undoable), size: Math.max(0, int(lastBatch.size) ?? 0) }
+      : null,
   };
 }
