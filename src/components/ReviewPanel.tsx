@@ -112,9 +112,11 @@ export function ReviewPanel({
   const phase = !choice ? "waiting" : choice.kind === "REJECTED" ? "rejected" : choice.kind === "WENT_BACK" ? "went-back" : "approved";
 
   // The version on screen: the default one (the approved one while it stands, else the newest), or
-  // the one the customer opened in the list since their last choice. A choice or an Undo shows the
-  // default again, so after going back the version gone back to is on screen.
-  const since = line.last_choice?.event_id ?? null;
+  // the one the customer opened in the list since their last choice or Undo. A choice or an Undo
+  // shows the default again, so after going back the version gone back to is on screen. Each one
+  // adds to the item's history, so its newest entry tells them apart; the last choice can't, as an
+  // Undo brings an earlier one back (and with it a version opened before).
+  const since = line.history[0]?.event_id ?? null;
   const [picked, setPicked] = useState<{ version: number; since: number | null } | null>(null);
   const shown =
     (picked && picked.since === since ? line.versions.find((v) => v.version === picked.version) : undefined) ?? mainVersion(line);
@@ -236,7 +238,8 @@ export function ReviewPanel({
         {note && note.pictures.length > 0 ? (
           <NotePictures note={note} onOpen={(index) => setViewer({ kind: "pictures", eventId: note.event_id, index })} />
         ) : null}
-        <p>We&apos;ll make the changes and send you a new version.</p>
+        {/* A locked, shipped or cancelled order gets no new version. */}
+        {readOnly ? null : <p>We&apos;ll make the changes and send you a new version.</p>}
       </>
     ) : choice && phase === "went-back" ? (
       <>

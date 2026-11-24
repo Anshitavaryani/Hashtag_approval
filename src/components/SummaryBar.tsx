@@ -55,17 +55,29 @@ export function ApproveAll({
 
   const undoing = busy === "undo-all";
   const size = batch?.size ?? 0;
+  // An item changed on its own since keeps that choice, so the Undo takes back only the batch's
+  // approvals still standing. When that's fewer than it approved, say how many.
+  const standing = batch ? view.lines.filter((line) => line.last_choice?.batch_id === batch.batch_id).length : 0;
+  const partly = standing > 0 && standing < size;
   return (
     <div className="space-y-3">
       {batch ? (
         <div className="flex items-center justify-between gap-3 rounded-xl border border-success/30 bg-success-soft py-2 pr-2 pl-3.5 text-success">
           <p id="batch-outcome" tabIndex={-1} className="flex min-w-0 items-center gap-1.5 text-sm font-semibold outline-none">
             <CircleCheck className="size-4 shrink-0" aria-hidden />
-            You approved {size === 1 ? "1 item" : size > 1 ? `${size} items` : "these items"} at once.
+            <span>
+              You approved {size === 1 ? "1 item" : size > 1 ? `${size} items` : "these items"} at once.
+              {partly ? (
+                <span id="batch-undo-reach" className="block text-xs font-normal text-balance">
+                  Undo takes back {standing} of them.
+                </span>
+              ) : null}
+            </span>
           </p>
           <Button
             variant="outline"
             aria-label="Undo Approve all"
+            aria-describedby={partly ? "batch-undo-reach" : undefined}
             className="shrink-0 border-success/40 bg-card px-3.5"
             disabled={busy !== null}
             onClick={onUndo}

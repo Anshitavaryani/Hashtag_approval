@@ -173,6 +173,12 @@ export default function ApprovalApp() {
     lastLoad.current = Date.now();
     const result = await approvalApi.view(current);
     if (writes.current !== before || tokenRef.current !== current) return;
+    // A box opened while the view was on its way: leave the page as the box found it, and let the
+    // next return to the tab load again.
+    if (boxOpenRef.current) {
+      lastLoad.current = 0;
+      return;
+    }
     if (result.ok && result.view) {
       showView(current, result.view);
     } else if (!result.ok && result.kind === "invalid") {

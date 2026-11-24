@@ -30,6 +30,13 @@ const isPngOrJpeg = (file: File) =>
   file.type === "image/png" || file.type === "image/jpeg" || (!file.type && /\.(png|jpe?g)$/i.test(file.name));
 
 /**
+ * What went wrong in the box, and where it shows: a refused picture under the picture rules,
+ * anything from Submit at the end, by the Submit button. `n` counts the messages, so each one is
+ * a new alert (read out, and brought into view) even when it repeats the last.
+ */
+type Problem = { text: string; at: "pictures" | "submit"; n: number };
+
+/**
  * The Reject box for an item's newest version: what to change and up to five pictures, then
  * Submit. A note or a picture is needed. The draft, and the version and last choice recorded
  * when the box opened, belong to the page (ApprovalApp): closing the box, or a Submit the page
@@ -62,10 +69,13 @@ export function RejectSheet({
   onSubmit: (form: FormData) => Promise<Outcome>;
   onCloseAutoFocus: ComponentProps<typeof SheetContent>["onCloseAutoFocus"];
 }) {
-  const [problem, setProblem] = useState("");
+  const [problem, setProblem] = useState<Problem | null>(null);
   const input = useRef<HTMLInputElement>(null);
   const ids = useId();
   const { text, pictures } = draft;
+  const say = (at: Problem["at"], message: string) =>
+    setProblem((shown) => (message ? { text: message, at, n: (shown?.n ?? 0) + 1 } : null));
+  const problemAt = (at: Problem["at"]) => (problem?.at === at ? <Alert key={problem.n} text={problem.text} /> : null);
 
   const addFiles = (files: FileList | null) => {
     if (!files?.length) return;
@@ -79,7 +89,7 @@ export function RejectSheet({
       else added.push({ key: key++, file });
     }
     onDraftChange({ text, pictures: [...pictures, ...added] });
-    setProblem([...new Set(refused)].join(" "));
+    say("pictures", [...new Set(refused)].join(" "));
     // Lets the same file be picked again after it was removed.
     if (input.current) input.current.value = "";
   };
@@ -87,10 +97,10 @@ export function RejectSheet({
   const submit = async () => {
     const body = text.trim();
     if (!body && pictures.length === 0) {
-      setProblem("Tell us what to change, or add a picture.");
+      say("submit", "Tell us what to change, or add a picture.");
       return;
     }
-    setProblem("");
+    setProblem(null);
     // Text fields before the files, so the server has read them by the time it checks the files.
     const form = new FormData();
     if (body) form.append("body", body);
@@ -98,7 +108,7 @@ export function RejectSheet({
     form.append("last_choice_id", lastChoiceId === null ? "" : String(lastChoiceId));
     for (const picture of pictures) form.append("approval_picture", picture.file, picture.file.name);
     const outcome = await onSubmit(form);
-    if (outcome.status === "failed" && outcome.message) setProblem(outcome.message);
+    if (outcome.status === "failed" && outcome.message) say("submit", outcome.message);
   };
 
   const remaining = MAX_CHARS - text.length;
@@ -141,7 +151,7 @@ export function RejectSheet({
               rows={5}
               onChange={(event) => {
                 onDraftChange({ text: event.target.value, pictures });
-                setProblem("");
+                setProblem(null);
               }}
               aria-describedby={`${ids}-count`}
               className="block w-full resize-y rounded-lg border border-input bg-card px-3 py-2 text-base focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
@@ -163,6 +173,7 @@ export function RejectSheet({
             <p className="text-xs text-muted-foreground">
               Show us what you mean: PNG or JPG, up to {MAX_PICTURES} pictures, 10 MB each.
             </p>
+            {problemAt("pictures")}
             {pictures.length > 0 ? (
               <ul className="grid grid-cols-3 gap-2 sm:grid-cols-5" aria-labelledby={`${ids}-pictures`}>
                 {pictures.map((picture, i) => (
@@ -176,7 +187,7 @@ export function RejectSheet({
                       disabled={sending}
                       onClick={() => {
                         onDraftChange({ text, pictures: pictures.filter((p) => p !== picture) });
-                        setProblem("");
+                        setProblem(null);
                       }}
                     >
                       <X aria-hidden />
@@ -205,14 +216,24 @@ export function RejectSheet({
             </Button>
           </div>
 
-          {problem ? (
-            <p role="alert" className="rounded-lg bg-destructive-soft px-3 py-2 text-sm text-destructive">
-              {problem}
-            </p>
-          ) : null}
+          {problemAt("submit")}
         </div>
       </SheetContent>
     </Sheet>
+  );
+}
+
+// Brings a new message into view: on a phone the box scrolls, and the end of it (or the picture
+// rules, after scrolling down) can be out of sight.
+const reveal = (element: HTMLElement | null) => {
+  element?.scrollIntoView({ block: "nearest" });
+};
+
+function Alert({ text }: { text: string }) {
+  return (
+    <p ref={reveal} role="alert" className="rounded-lg bg-destructive-soft px-3 py-2 text-sm text-destructive">
+      {text}
+    </p>
   );
 }
 
